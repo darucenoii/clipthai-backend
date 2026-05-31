@@ -218,7 +218,7 @@ app.post('/mode5', async (req, res) => {
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      return await renderRemotion('mode5-viral', { keyword, footage, bgm }, jobId);
+      return await renderRemotion('mode5-viral', { keyword, footage: Array.isArray(footage) ? footage[0] : footage, bgm: Array.isArray(bgm) ? bgm[0] : (bgm || "") }, jobId);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
