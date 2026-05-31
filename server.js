@@ -159,7 +159,7 @@ app.post('/mode2', async (req, res) => {
       await writeFile(audioPath, audioBuffer);
       const audioUrl = `${PUBLIC_BASE_URL}/outputs/${jobId}.mp3`;
 
-      return await renderRemotion('ReviewClip', {
+      return await renderRemotion('review-clip', {
         audioUrl,
         footageUrls,
         scriptText,
@@ -190,7 +190,7 @@ app.post('/mode3', async (req, res) => {
       await writeFile(audioPath, audioBuffer);
       const audioUrl = `${PUBLIC_BASE_URL}/outputs/${jobId}.mp3`;
 
-      return await renderRemotion('HybridClip', {
+      return await renderRemotion('hybrid-clip', {
         audioUrl,
         footageUrls,
         scriptText,
@@ -218,7 +218,7 @@ app.post('/mode5', async (req, res) => {
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      return await renderRemotion('Mode5Viral', { keyword, footage, bgm }, jobId);
+      return await renderRemotion('mode5-viral', { keyword, footage, bgm }, jobId);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -237,7 +237,7 @@ app.post('/mode6', async (req, res) => {
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      return await renderRemotion('Mode6Split', {
+      return await renderRemotion('mode6-split', {
         footageTop,
         speakerVideo,
         ratio: ratio || '55/45',
