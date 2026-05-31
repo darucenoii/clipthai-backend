@@ -1,23 +1,38 @@
-const express = require('express');
-const { randomUUID } = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
+import express from 'express';
+import cors from 'cors';
+import { randomUUID } from 'crypto';
+import fs from 'fs';
+import { writeFile, mkdir, rm } from 'fs/promises';
+import { existsSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
+import { bundle } from '@remotion/bundler';
+import { renderMedia, selectComposition } from '@remotion/renderer';
+
+const execFileP = promisify(execFile);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const PORT = process.env.PORT || 3000;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const OUTPUT_DIR = path.join(__dirname, 'public', 'outputs');
+
+await mkdir(OUTPUT_DIR, { recursive: true });
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.use('/outputs', express.static(OUTPUT_DIR));
 
+// In-memory job store
 const jobs = new Map();
-
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:3001';
-const OUTPUT_DIR = path.join(os.tmpdir(), 'clipthai-renders');
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-app.use('/renders', express.static(OUTPUT_DIR));
-app.use('/outputs', express.static(path.join(__dirname, 'public', 'outputs')));
 
 // ---------- HEALTH ----------
 app.get('/health', (req, res) => {
@@ -25,7 +40,14 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ClipThai backend running', version: '1.0.0' });
+  res.json({ status: 'ClipThai backend running', version: '2.0.0' });
+});
+
+// ---------- STATUS ----------
+app.get('/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({ jobId: req.params.jobId, ...job });
 });
 
 // ---------- HELPERS ----------
@@ -54,34 +76,42 @@ async function generateTTS(text, voiceId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+async function renderRemotion(compositionId, inputProps, jobId) {
+  const bundleLocation = await bundle({
+    entryPoint: path.join(__dirname, 'remotion', 'src', 'index.ts'),
+    webpackOverride: (c) => c,
+  });
+
+  const composition = await selectComposition({
+    serveUrl: bundleLocation,
+    id: compositionId,
+    inputProps,
+  });
+
+  const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+  await renderMedia({
+    composition: { ...composition, width: 1080, height: 1920, fps: 30 },
+    serveUrl: bundleLocation,
+    codec: 'h264',
+    outputLocation: outputPath,
+    inputProps,
+  });
+
+  return `${PUBLIC_BASE_URL}/outputs/${jobId}.mp4`;
+}
+
 function runJob(jobId, fn) {
   jobs.set(jobId, { status: 'processing', progress: 0, createdAt: Date.now() });
   (async () => {
     try {
       const outputUrl = await fn();
-      jobs.set(jobId, {
-        status: 'completed',
-        progress: 100,
-        outputUrl,
-        completedAt: Date.now(),
-      });
+      jobs.set(jobId, { status: 'completed', progress: 100, outputUrl, completedAt: Date.now() });
     } catch (err) {
       console.error(`[${jobId}]`, err);
-      jobs.set(jobId, {
-        status: 'failed',
-        error: err.message,
-        failedAt: Date.now(),
-      });
+      jobs.set(jobId, { status: 'failed', error: err.message, failedAt: Date.now() });
     }
   })();
 }
-
-// ---------- STATUS ----------
-app.get('/status/:jobId', (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json({ jobId: req.params.jobId, ...job });
-});
 
 // ---------- MODE 1 — ตัดคลิปอัตโนมัติ ----------
 app.post('/mode1', async (req, res) => {
@@ -93,45 +123,19 @@ app.post('/mode1', async (req, res) => {
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      // Whisper transcribe
-      const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-        body: (() => {
-          const fd = new FormData();
-          fd.append('model', 'whisper-1');
-          fd.append('language', language);
-          fd.append('url', videoUrl);
-          return fd;
-        })(),
+      const msg = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: `วิดีโอ URL: ${videoUrl}
+เลือกช่วงเวลาที่น่าสนใจ 3 ช่วง สำหรับตัดเป็น clip 20-45 วินาที
+ตอบเป็น JSON array เท่านั้น: [{"start": 0, "end": 30, "reason": "..."}]`,
+        }],
       });
 
-      const transcript = await whisperRes.json();
-
-      // Claude เลือกช่วงที่ดีที่สุด
-      const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 1000,
-          messages: [{
-            role: 'user',
-            content: `จาก transcript นี้: ${JSON.stringify(transcript)}
-เลือกช่วงเวลาที่น่าสนใจที่สุด 3 ช่วง สำหรับตัดเป็น clip สั้น 20-45 วินาที
-ตอบเป็น JSON array: [{"start": 0, "end": 30, "reason": "..."}]`,
-          }],
-        }),
-      });
-
-      const claudeData = await claudeRes.json();
-      const segments = JSON.parse(claudeData.content[0].text);
-
-      return `${PUBLIC_BASE_URL}/status/${jobId}`;
+      const segments = JSON.parse(msg.content[0].text);
+      return `${PUBLIC_BASE_URL}/outputs/${jobId}_result.json`;
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -143,65 +147,38 @@ app.post('/mode2', async (req, res) => {
   try {
     const { scriptText, voiceId, footageUrls, productName, price } = req.body;
     if (!scriptText || !voiceId || !Array.isArray(footageUrls) || footageUrls.length === 0) {
-      return res.status(400).json({ error: 'Missing required fields: scriptText, voiceId, footageUrls' });
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
     const jobId = `mode2_${randomUUID()}`;
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      // 1) TTS ด้วย ElevenLabs
       const audioBuffer = await generateTTS(scriptText, voiceId);
       const audioPath = path.join(OUTPUT_DIR, `${jobId}.mp3`);
-      fs.writeFileSync(audioPath, audioBuffer);
-      const audioUrl = `${PUBLIC_BASE_URL}/renders/${jobId}.mp3`;
+      await writeFile(audioPath, audioBuffer);
+      const audioUrl = `${PUBLIC_BASE_URL}/outputs/${jobId}.mp3`;
 
-      // 2) Remotion render
-      const { bundle } = require('@remotion/bundler');
-      const { renderMedia, selectComposition } = require('@remotion/renderer');
-
-      const bundleLocation = await bundle({
-        entryPoint: path.join(__dirname, 'remotion', 'src', 'index.ts'),
-        webpackOverride: (c) => c,
-      });
-
-      const inputProps = {
+      return await renderRemotion('ReviewClip', {
         audioUrl,
         footageUrls,
         scriptText,
         productName: productName || '',
         price: price || '',
         captionStyle: 'review',
-      };
-
-      const composition = await selectComposition({
-        serveUrl: bundleLocation,
-        id: 'ReviewClip',
-        inputProps,
-      });
-
-      const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
-      await renderMedia({
-        composition: { ...composition, width: 1080, height: 1920, fps: 30 },
-        serveUrl: bundleLocation,
-        codec: 'h264',
-        outputLocation: outputPath,
-        inputProps,
-      });
-
-      return `${PUBLIC_BASE_URL}/renders/${jobId}.mp4`;
+      }, jobId);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- MODE 3 — Hybrid AI + ฟุตเทจจริง ----------
+// ---------- MODE 3 — Hybrid AI ----------
 app.post('/mode3', async (req, res) => {
   try {
     const { scriptText, voiceId, footageUrls, productName, price, platform, cta } = req.body;
     if (!scriptText || !voiceId || !Array.isArray(footageUrls) || footageUrls.length === 0) {
-      return res.status(400).json({ error: 'Missing required fields: scriptText, voiceId, footageUrls' });
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
     const jobId = `mode3_${randomUUID()}`;
@@ -210,18 +187,10 @@ app.post('/mode3', async (req, res) => {
     runJob(jobId, async () => {
       const audioBuffer = await generateTTS(scriptText, voiceId);
       const audioPath = path.join(OUTPUT_DIR, `${jobId}.mp3`);
-      fs.writeFileSync(audioPath, audioBuffer);
-      const audioUrl = `${PUBLIC_BASE_URL}/renders/${jobId}.mp3`;
+      await writeFile(audioPath, audioBuffer);
+      const audioUrl = `${PUBLIC_BASE_URL}/outputs/${jobId}.mp3`;
 
-      const { bundle } = require('@remotion/bundler');
-      const { renderMedia, selectComposition } = require('@remotion/renderer');
-
-      const bundleLocation = await bundle({
-        entryPoint: path.join(__dirname, 'remotion', 'src', 'index.ts'),
-        webpackOverride: (c) => c,
-      });
-
-      const inputProps = {
+      return await renderRemotion('HybridClip', {
         audioUrl,
         footageUrls,
         scriptText,
@@ -230,24 +199,7 @@ app.post('/mode3', async (req, res) => {
         platform: platform || 'tiktok',
         cta: cta || '',
         showPriceOverlay: true,
-      };
-
-      const composition = await selectComposition({
-        serveUrl: bundleLocation,
-        id: 'HybridClip',
-        inputProps,
-      });
-
-      const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
-      await renderMedia({
-        composition: { ...composition, width: 1080, height: 1920, fps: 30 },
-        serveUrl: bundleLocation,
-        codec: 'h264',
-        outputLocation: outputPath,
-        inputProps,
-      });
-
-      return `${PUBLIC_BASE_URL}/renders/${jobId}.mp4`;
+      }, jobId);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -266,34 +218,7 @@ app.post('/mode5', async (req, res) => {
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      const { bundle } = require('@remotion/bundler');
-      const { renderMedia, selectComposition } = require('@remotion/renderer');
-
-      const bundleLocation = await bundle({
-        entryPoint: path.join(__dirname, 'remotion', 'src', 'index.ts'),
-        webpackOverride: (c) => c,
-      });
-
-      const inputProps = { keyword, footage, bgm };
-
-      const composition = await selectComposition({
-        serveUrl: bundleLocation,
-        id: 'Mode5Viral',
-        inputProps,
-      });
-
-      const outputPath = path.join(__dirname, 'public', 'outputs', `${jobId}.mp4`);
-      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-
-      await renderMedia({
-        composition: { ...composition, width: 1080, height: 1920, fps: 30 },
-        serveUrl: bundleLocation,
-        codec: 'h264',
-        outputLocation: outputPath,
-        inputProps,
-      });
-
-      return `${PUBLIC_BASE_URL}/outputs/${jobId}.mp4`;
+      return await renderRemotion('Mode5Viral', { keyword, footage, bgm }, jobId);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -312,41 +237,14 @@ app.post('/mode6', async (req, res) => {
     res.json({ jobId });
 
     runJob(jobId, async () => {
-      const { bundle } = require('@remotion/bundler');
-      const { renderMedia, selectComposition } = require('@remotion/renderer');
-
-      const bundleLocation = await bundle({
-        entryPoint: path.join(__dirname, 'remotion', 'src', 'index.ts'),
-        webpackOverride: (c) => c,
-      });
-
-      const inputProps = {
+      return await renderRemotion('Mode6Split', {
         footageTop,
         speakerVideo,
         ratio: ratio || '55/45',
         captionStyle: captionStyle || 'balltalk',
         keywordColor: keywordColor || '#FFD700',
         bgmMood: bgmMood || 'dramatic',
-      };
-
-      const composition = await selectComposition({
-        serveUrl: bundleLocation,
-        id: 'Mode6Split',
-        inputProps,
-      });
-
-      const outputPath = path.join(__dirname, 'public', 'outputs', `${jobId}.mp4`);
-      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-
-      await renderMedia({
-        composition: { ...composition, width: 1080, height: 1920, fps: 30 },
-        serveUrl: bundleLocation,
-        codec: 'h264',
-        outputLocation: outputPath,
-        inputProps,
-      });
-
-      return `${PUBLIC_BASE_URL}/outputs/${jobId}.mp4`;
+      }, jobId);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -354,5 +252,4 @@ app.post('/mode6', async (req, res) => {
 });
 
 // ---------- START ----------
-const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`ClipThai backend listening on :${PORT}`));
