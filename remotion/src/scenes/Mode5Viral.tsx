@@ -1,17 +1,30 @@
 import React from "react";
-import { AbsoluteFill, Audio, Video, useCurrentFrame, interpolate } from "remotion";
+import { AbsoluteFill, Video, Img, Audio, useCurrentFrame, useVideoConfig, interpolate, spring } from "remotion";
 
-export const Mode5Viral: React.FC<{ keyword: string; footage: string; bgm: string }> = ({
-  keyword,
-  footage,
-  bgm,
-}) => {
+interface Props {
+  keyword: string;
+  footage: string;
+  bgm: string;
+}
+
+const isImage = (url: string) => /\.(webp|jpg|jpeg|png|gif)(\?|$)/i.test(url);
+
+export const Mode5Viral: React.FC<Props> = ({ keyword, footage, bgm }) => {
   const frame = useCurrentFrame();
-  const scale = interpolate(frame, [0, 20], [0.8, 1], { extrapolateRight: "clamp" });
+  const { fps } = useVideoConfig();
+
+  const scale = spring({ frame, fps, config: { damping: 12 }, from: 0.8, to: 1 });
   const opacity = interpolate(frame, [0, 15], [0, 1], { extrapolateRight: "clamp" });
+
   return (
     <AbsoluteFill style={{ background: "#0a0a0a" }}>
-      {footage ? <Video src={footage} muted /> : null}
+      {footage ? (
+        isImage(footage) ? (
+          <Img src={footage} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        ) : (
+          <Video src={footage} muted style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        )
+      ) : null}
       <AbsoluteFill
         style={{
           alignItems: "center",
