@@ -209,14 +209,16 @@ app.post('/mode3', async (req, res) => {
 // ---------- MODE 5 — Viral Story Clip ----------
 app.post('/mode5', async (req, res) => {
   try {
-    const { keyword, footage, bgm } = req.body;
+  const { keyword, footage, imageUrls, videoUrls, bgm } = req.body;
+  const allMedia = imageUrls || videoUrls || footage || [];
+  const firstMedia = Array.isArray(allMedia) ? allMedia[0] : allMedia;
     if (!keyword || !Array.isArray(footage)) {
       return res.status(400).json({ error: 'Missing keyword or footage' });
     }
 
     const jobId = `mode5_${randomUUID()}`;
     res.json({ jobId });
-
+    return await renderRemotion('mode5-viral', { keyword, footage: firstMedia, bgm: Array.isArray(bgm) ? bgm[0] : (bgm || "") }, jobId);
     runJob(jobId, async () => {
       return await renderRemotion('mode5-viral', { keyword, footage: Array.isArray(footage) ? footage[0] : footage, bgm: Array.isArray(bgm) ? bgm[0] : (bgm || "") }, jobId);
     });
