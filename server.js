@@ -230,7 +230,9 @@ app.post('/mode5', async (req, res) => {
 // ---------- MODE 6 — Split-Screen Story ----------
 app.post('/mode6', async (req, res) => {
   try {
-    const { footageTop, speakerVideo, ratio, captionStyle, keywordColor, bgmMood } = req.body;
+  const { footageTop: footageTopRaw, speakerVideo: speakerVideoRaw, ratio, captionStyle, keywordColor, bgmMood } = req.body;
+  const footageTop = Array.isArray(footageTopRaw) ? footageTopRaw[0] : footageTopRaw;
+  const speakerVideo = Array.isArray(speakerVideoRaw) ? speakerVideoRaw[0] : speakerVideoRaw;
     if (!footageTop || !speakerVideo) {
       return res.status(400).json({ error: 'Missing footageTop or speakerVideo' });
     }
