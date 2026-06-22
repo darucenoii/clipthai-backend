@@ -248,15 +248,14 @@ async function ytdlpDownload(url, outputPath) {
   const cookiesB64 = process.env.YOUTUBE_COOKIES_BASE64;
   if (cookiesB64 && cookiesB64.length > 100) {
     try {
-      const cookiesPath = '/tmp/yt_cookies.txt';  // fixed absolute path
+      const cookiesPath = '/tmp/yt_cookies.txt';
       const cookiesContent = Buffer.from(cookiesB64.trim(), 'base64').toString('utf8');
-      const { writeFileSync } = await import('fs');
-      writeFileSync(cookiesPath, cookiesContent, 'utf8');
+      await writeFile(cookiesPath, cookiesContent, 'utf8');
       cookiesArg = ['--cookies', cookiesPath];
       console.log('Using YouTube cookies, size:', cookiesContent.length);
     } catch(e) { console.log('Cookies setup failed:', e.message); }
   } else {
-    console.log('No cookies env var found');
+    console.log('No cookies env var, skipping');
   }
 
   const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath, ...cookiesArg];
