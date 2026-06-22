@@ -64,41 +64,35 @@ async function hasHighMotion(videoPath, startTime, endTime) {
   });
 }
 
-function buildVfFilter(aspectRatio, vw, vh, fps, duration, highMotion) {
-  const totalFrames = Math.max(Math.floor(duration * fps), 1);
-
-  // Simple zoom: slow gentle zoom in (works on all ffmpeg versions)
-  // highMotion = faster zoom, lowMotion = slower zoom
-  const zoomSpeed = highMotion ? '0.0015' : '0.0008';
-  const maxZoom = highMotion ? '1.4' : '1.2';
+function buildVfFilter(aspectRatio, vw, vh, highMotion) {
+  // zoom level: crop tighter on high motion (simulate zoom)
+  const zoomFactor = highMotion ? 1.3 : 1.1;
 
   let cropW, cropH, outW, outH;
 
   if (aspectRatio === '16:9') {
-    cropW = vw; cropH = Math.floor(vw * 9 / 16);
-    if (cropH > vh) { cropH = vh; cropW = Math.floor(vh * 16 / 9); }
     outW = 1280; outH = 720;
+    cropW = Math.floor(vw / zoomFactor);
+    cropH = Math.floor(cropW * 9 / 16);
+    if (cropH > vh) { cropH = vh; cropW = Math.floor(cropH * 16 / 9); }
   } else if (aspectRatio === '1:1') {
-    const s = Math.min(vw, vh);
-    cropW = s; cropH = s;
     outW = 720; outH = 720;
+    const base = Math.min(vw, vh);
+    cropW = Math.floor(base / zoomFactor);
+    cropH = cropW;
   } else {
     // 9:16
-    cropW = Math.floor(vh * 9 / 16);
-    if (cropW > vw) cropW = vw;
-    cropH = vh;
     outW = 720; outH = 1280;
+    cropH = Math.floor(vh / zoomFactor);
+    cropW = Math.floor(cropH * 9 / 16);
+    if (cropW > vw) { cropW = vw; cropH = Math.floor(cropW * 16 / 9); }
   }
 
-  const cx = Math.floor((vw - cropW) / 2);
-  const cy = Math.floor((vh - cropH) / 2);
+  // center crop
+  const cx = Math.max(Math.floor((vw - cropW) / 2), 0);
+  const cy = Math.max(Math.floor((vh - cropH) / 2), 0);
 
-  // crop to aspect ratio first, then apply smooth zoom
-  const cropFilter = `crop=${cropW}:${cropH}:${cx}:${cy}`;
-  const zoomFilter = `zoompan=z='min(zoom+${zoomSpeed},${maxZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${cropW}x${cropH}:fps=${fps}`;
-  const scaleFilter = `scale=${outW}:${outH}`;
-
-  return `${cropFilter},${zoomFilter},${scaleFilter}`;
+  return `crop=${cropW}:${cropH}:${cx}:${cy},scale=${outW}:${outH}`;
 }
 
 const app = express();
@@ -210,9 +204,8 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
     const duration = h.end - h.start;
 
-    // Check motion level for this clip
     const highMotion = await hasHighMotion(videoPath, h.start, h.end);
-    const vfFilter = buildVfFilter(aspectRatio, vw, vh, fps, duration, highMotion);
+    const vfFilter = buildVfFilter(aspectRatio, vw, vh, highMotion);
     console.log(`Clip ${i+1} [${h.start}-${h.end}s] highMotion=${highMotion}`);
 
     await execFileAsync('ffmpeg', [
