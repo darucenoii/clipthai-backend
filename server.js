@@ -26,22 +26,27 @@ async function getVideoDimensions(videoPath) {
   try {
     const result = await execFileAsync('ffprobe', [
       '-v', 'error', '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height',
+      '-show_entries', 'stream=width,height,r_frame_rate',
       '-of', 'csv=p=0', videoPath
     ]);
-    const out = (result.stdout || result.stderr || '640,360').trim();
-    const [w, h] = out.split(',').map(Number);
-    return { width: w || 640, height: h || 360 };
+    const out = (result.stdout || result.stderr || '640,360,30/1').trim();
+    const parts = out.split(',');
+    const w = parseInt(parts[0]) || 640;
+    const h = parseInt(parts[1]) || 360;
+    const fpsStr = parts[2] || '30/1';
+    const fpsParts = fpsStr.split('/');
+    const fps = Math.round(parseInt(fpsParts[0]) / (parseInt(fpsParts[1]) || 1));
+    return { width: w, height: h, fps: fps || 30 };
   } catch {
-    return { width: 640, height: 360 };
+    return { width: 640, height: 360, fps: 30 };
   }
 }
 
-// Analyze motion in a specific time range and return best crop X position
-async function getSmartCropX(videoPath, startTime, endTime, targetWidth, videoWidth) {
+// Analyze motion per-frame in clip range, return list of high-motion timestamps
+async function getMotionTimestamps(videoPath, startTime, endTime) {
   return new Promise((resolve) => {
-    const duration = Math.min(endTime - startTime, 10); // analyze up to 10s of clip
-    const defaultX = Math.floor((videoWidth - targetWidth) / 2);
+    const duration = Math.min(endTime - startTime, 60);
+    const motionFrames = [];
 
     const proc = spawn('ffmpeg', [
       '-ss', String(startTime),
@@ -55,43 +60,65 @@ async function getSmartCropX(videoPath, startTime, endTime, targetWidth, videoWi
     proc.stderr.on('data', d => stderr += d.toString());
     proc.on('close', () => {
       try {
-        // Parse motion vectors
-        const matches = [...stderr.matchAll(/MV_x=([+-]?\d+\.?\d*)/g)];
-        if (matches.length < 5) return resolve(defaultX);
-
-        // Build histogram of x positions with high motion
-        const xCounts = {};
-        matches.forEach(m => {
-          const mv = parseFloat(m[1]);
-          if (Math.abs(mv) < 2) return; // ignore tiny motion
-          // convert motion vector to approximate screen x region
-          const bucket = Math.floor((mv + videoWidth) / 32) * 32;
-          xCounts[bucket] = (xCounts[bucket] || 0) + 1;
+        // Find frames with high motion magnitude
+        const frameBlocks = stderr.split('frame:');
+        frameBlocks.forEach((block, idx) => {
+          const mvMatches = [...block.matchAll(/MV_[xy]=([+-]?\d+\.?\d*)/g)];
+          if (mvMatches.length === 0) return;
+          const magnitude = mvMatches.reduce((sum, m) => sum + Math.abs(parseFloat(m[1])), 0) / mvMatches.length;
+          if (magnitude > 3) { // high motion threshold
+            motionFrames.push({ frameIdx: idx, magnitude });
+          }
         });
-
-        if (Object.keys(xCounts).length === 0) return resolve(defaultX);
-
-        // Find x bucket with most motion
-        const maxBucket = Object.entries(xCounts).sort((a, b) => b[1] - a[1])[0][0];
-        const motionX = parseInt(maxBucket);
-
-        // Calculate crop x — center around motion region
-        const cropX = Math.min(
-          Math.max(Math.floor(motionX - targetWidth / 2), 0),
-          videoWidth - targetWidth
-        );
-
-        console.log(`Smart crop: motion at x=${motionX}, cropX=${cropX} (video=${videoWidth}, target=${targetWidth})`);
-        resolve(cropX);
+        resolve(motionFrames);
       } catch {
-        resolve(defaultX);
+        resolve([]);
       }
     });
-    proc.on('error', () => resolve(defaultX));
-
-    // Timeout fallback
-    setTimeout(() => resolve(defaultX), 12000);
+    proc.on('error', () => resolve([]));
+    setTimeout(() => resolve(motionFrames), 15000);
   });
+}
+
+// Build dynamic zoompan filter based on motion analysis
+async function buildDynamicZoomFilter(videoPath, startTime, endTime, aspectRatio, vw, vh, fps) {
+  const duration = endTime - startTime;
+  const totalFrames = Math.floor(duration * fps);
+
+  // Get motion timestamps for this clip
+  const motionFrames = await getMotionTimestamps(videoPath, startTime, endTime);
+
+  // Build zoom expression: zoom in on high-motion frames, zoom out on calm frames
+  // zoompan: z=zoom, x=pan_x, y=pan_y, d=duration_frames
+  let zoomExpr, xExpr, yExpr;
+
+  if (motionFrames.length > 3) {
+    // Dynamic zoom: zoom in to 1.5x on high motion, return to 1x on calm
+    zoomExpr = `if(gt(on\\,1)\\,if(gt(mod(on\\,${fps})\\,${Math.floor(fps*0.3)})\\,min(zoom+0.002\\,1.5)\\,max(zoom-0.004\\,1))\\,1)`;
+    xExpr = `iw/2-(iw/zoom/2)`;
+    yExpr = `ih/2-(ih/zoom/2)`;
+  } else {
+    // Gentle zoom in throughout clip (for calm footage)
+    zoomExpr = `min(zoom+0.0008\\,1.3)`;
+    xExpr = `iw/2-(iw/zoom/2)`;
+    yExpr = `ih/2-(ih/zoom/2)`;
+  }
+
+  const zoompan = `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=${totalFrames}:s=${vw}x${vh}:fps=${fps}`;
+
+  if (aspectRatio === '16:9') {
+    return `${zoompan},scale=1280:720`;
+  } else if (aspectRatio === '1:1') {
+    const size = Math.min(vw, vh);
+    const cx = Math.floor((vw - size) / 2);
+    const cy = Math.floor((vh - size) / 2);
+    return `crop=${size}:${size}:${cx}:${cy},${zoompan.replace(`s=${vw}x${vh}`, `s=${size}x${size}`)},scale=720:720`;
+  } else {
+    // 9:16
+    const targetW = Math.floor(vh * 9 / 16);
+    const cropX = Math.floor((vw - targetW) / 2);
+    return `crop=${targetW}:${vh}:${cropX}:0,${zoompan.replace(`s=${vw}x${vh}`, `s=${targetW}x${vh}`)},scale=720:1280`;
+  }
 }
 
 const app = express();
@@ -157,9 +184,8 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
     await execFileAsync('curl', ['-L', '-o', videoPath, inputUrl], { timeout: 120000 });
   }
 
-  // Get video dimensions for smart crop
-  const { width: vw, height: vh } = await getVideoDimensions(videoPath);
-  console.log(`Video dimensions: ${vw}x${vh}`);
+  const { width: vw, height: vh, fps } = await getVideoDimensions(videoPath);
+  console.log(`Video: ${vw}x${vh} @ ${fps}fps`);
 
   // Step 2: Extract audio
   set({ progress: 30, step: 'extracting_audio' });
@@ -192,7 +218,7 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
         content: `You are a viral video editor. Pick 3-5 best highlight clips.
 RULES:
 - Each clip minimum 6 seconds (end - start >= 6)
-- Each clip maximum 60 seconds (end - start <= 60)
+- Each clip maximum 45 seconds (end - start <= 45)
 Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}`
       },
       { role: 'user', content: `Find highlights:\n${segText}` }
@@ -203,11 +229,11 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
   let { highlights = [] } = JSON.parse(gptRes.choices[0].message.content);
   highlights = highlights.map(h => {
     if (h.end - h.start < 6) h.end = h.start + 6;
-    if (h.end - h.start > 60) h.end = h.start + 60;
+    if (h.end - h.start > 45) h.end = h.start + 45;
     return h;
   });
 
-  // Step 5: Cut + smart crop each clip individually
+  // Step 5: Cut + dynamic zoom each clip
   set({ progress: 75, step: 'cutting_clips' });
   const clips = [];
 
@@ -216,28 +242,9 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const clipId = `${jobId}_clip${i + 1}`;
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
 
-    let vfFilter;
-
-    if (aspectRatio === '16:9') {
-      vfFilter = `scale=1280:720`;
-    } else if (aspectRatio === '1:1') {
-      const size = Math.min(vw, vh);
-      const x = Math.floor((vw - size) / 2);
-      const y = Math.floor((vh - size) / 2);
-      vfFilter = `crop=${size}:${size}:${x}:${y},scale=720:720`;
-    } else {
-      // 9:16 — smart motion crop per clip
-      const targetW = Math.floor(vh * 9 / 16);
-      if (targetW >= vw) {
-        vfFilter = `scale=720:1280`;
-      } else {
-        // analyze motion in THIS clip's time range
-        const cropX = await getSmartCropX(videoPath, h.start, h.end, targetW, vw);
-        vfFilter = `crop=${targetW}:${vh}:${cropX}:0,scale=720:1280`;
-      }
-    }
-
-    console.log(`Clip ${i+1} [${h.start}-${h.end}s] filter: ${vfFilter}`);
+    console.log(`Building dynamic zoom for clip ${i+1} [${h.start}-${h.end}s]...`);
+    const vfFilter = await buildDynamicZoomFilter(videoPath, h.start, h.end, aspectRatio, vw, vh, fps);
+    console.log(`Clip ${i+1} filter: ${vfFilter.slice(0, 80)}...`);
 
     await execFileAsync('ffmpeg', [
       '-i', videoPath,
@@ -250,7 +257,7 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
       '-crf', '23',
       '-movflags', '+faststart',
       '-y', clipPath
-    ], { timeout: 120000 });
+    ], { timeout: 180000 }); // longer timeout for zoompan
 
     clips.push({
       url: `${PUBLIC_BASE_URL}/outputs/${clipId}.mp4`,
