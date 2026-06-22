@@ -92,17 +92,18 @@ function buildVfFilter(aspectRatio, vw, vh, highMotion) {
     // 9:16
     // Already 9:16?
     if (Math.abs(inputRatio - 9/16) < 0.05) return `scale=720:1280`;
-    // Input is wider than 9:16 (e.g. 16:9) — crop width
+    // Input is wider — crop width to make 9:16, then scale up
     const targetW = Math.floor(vh * 9 / 16);
     if (targetW <= vw) {
-      const cropW = Math.floor(targetW / zoomFactor);
-      const cx = Math.floor((vw - cropW) / 2);
-      return `crop=${cropW}:${vh}:${cx}:0,scale=720:1280`;
+      const zoomedW = Math.floor(targetW / zoomFactor);
+      const cx = Math.floor((vw - zoomedW) / 2);
+      return `crop=${zoomedW}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`;
     }
-    // Input is taller than 9:16 — crop height
-    const cropH = Math.floor(vw * 16 / 9 / zoomFactor);
-    const cy = Math.floor((vh - cropH) / 2);
-    return `crop=${vw}:${cropH}:0:${cy},scale=720:1280`;
+    // Input is taller — crop height
+    const targetH = Math.floor(vw * 16 / 9);
+    const zoomedH = Math.floor(targetH / zoomFactor);
+    const cy = Math.floor((vh - zoomedH) / 2);
+    return `crop=${vw}:${zoomedH}:0:${cy},scale=720:1280:flags=lanczos`;
   }
 }
 
