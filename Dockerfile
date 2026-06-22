@@ -1,23 +1,21 @@
-FROM node:20-bookworm-slim
+FROM node:20-slim
 
-# Chromium + ffmpeg deps for Remotion + video processing
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    chromium \
-    fonts-liberation \
-    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
-    libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
-    libcairo2 libasound2 ca-certificates \
+# Install ffmpeg and yt-dlp
+RUN apt-get update && apt-get install -y \
+  ffmpeg \
+  python3 \
+  curl \
+  && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+  && chmod a+rx /usr/local/bin/yt-dlp \
+  && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_ENV=production
-
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
-
+COPY package*.json ./
+RUN npm install --production
 COPY . .
+
+RUN mkdir -p public/outputs tmp
 
 EXPOSE 3000
 CMD ["node", "server.js"]
