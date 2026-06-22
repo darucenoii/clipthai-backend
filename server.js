@@ -23,9 +23,10 @@ const jobs = new Map();
 
 // Aspect ratio crop filters for ffmpeg
 const ASPECT_FILTERS = {
-  '9:16': 'crop=ih*9/16:ih,scale=1080:1920',   // vertical — TikTok/Reels/Shorts
-  '16:9': 'crop=iw:iw*9/16,scale=1920:1080',   // horizontal — YouTube
-  '1:1':  'crop=ih:ih,scale=1080:1080',         // square — Instagram
+  // crop from center then scale — works with any input resolution
+  '9:16': "crop=min(iw\\,ih*9/16):min(ih\\,iw*16/9),scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+  '16:9': "crop=min(iw\\,ih*16/9):min(ih\\,iw*9/16),scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+  '1:1':  "crop=min(iw\\,ih):min(ih\\,iw),scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2",
 };
 
 const app = express();
