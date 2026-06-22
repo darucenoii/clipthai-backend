@@ -194,7 +194,14 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
     model: 'gpt-4o-mini',
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: `Pick 3-5 viral highlight clips. Min 6s, max 45s each. Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}` },
+      { role: 'system', content: `You are a viral video editor. Pick 3-5 best highlight clips.
+RULES:
+- Each clip minimum 6 seconds (end - start >= 6)
+- Each clip maximum 45 seconds (end - start <= 45)
+- ALWAYS end each clip at a natural stopping point — after a sentence completes, after a goal/action finishes, after applause, or after a clear pause. Never cut mid-sentence or mid-action.
+- Start clips slightly before the action begins (1-2s early) so context is clear
+- Prefer clips that have a clear beginning, middle, and end
+Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}` },
       { role: 'user', content: `Find highlights:\n${segText}` }
     ],
     max_tokens: 1000,
@@ -204,6 +211,8 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
   highlights = highlights.map(h => {
     if (h.end - h.start < 6) h.end = h.start + 6;
     if (h.end - h.start > 45) h.end = h.start + 45;
+    // Add 2s buffer at end so action completes naturally
+    h.end = h.end + 2;
     return h;
   });
 
@@ -248,4 +257,3 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
 }
 
 app.listen(PORT, () => console.log(`ClipThai backend listening on :${PORT}`));
-// force update Mon Jun 22 19:59:20 +07 2026
