@@ -20,7 +20,6 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const jobs = new Map();
 
-// ─── Video info ────────────────────────────────────────────────────────────────
 async function getVideoDimensions(videoPath) {
   try {
     const r = await execFileAsync('ffprobe', [
@@ -37,21 +36,19 @@ async function getVideoDimensions(videoPath) {
   } catch { return { width: 1280, height: 720, fps: 30 }; }
 }
 
-// ─── Motion analysis: find where the action is per frame ──────────────────────
-// Samples the clip at 5fps, returns [{t, cx_norm, motion_score}]
-// cx_norm: 0.0=left edge, 1.0=right edge of frame
-async function analyzeMotion(videoPath, startTime, endTime, vw, vh) {
+// ─── Player detection: find centroid of non-grass pixels (players, ball, goal) ─
+// Returns [{t, cx_norm, cy_norm}] sampled every 0.25s
+async function detectPlayerCentroids(videoPath, startTime, endTime, vw, vh) {
   return new Promise((resolve) => {
     const duration = Math.min(endTime - startTime, 45);
-    // Skip scoreboard (top 13%) for motion analysis
-    const roiY = Math.round(vh * 0.13);
-    const roiH = vh - roiY;
+    // Scale down for speed, keep aspect ratio
+    const scaleW = 160, scaleH = Math.round(160 * vh / vw);
 
     const proc = spawn('ffmpeg', [
       '-ss', String(startTime), '-t', String(duration),
       '-i', videoPath,
-      '-vf', `crop=${vw}:${roiH}:0:${roiY},scale=160:${Math.round(160*roiH/vw)}`,
-      '-f', 'rawvideo', '-pix_fmt', 'gray', '-r', '5', 'pipe:1'
+      '-vf', `scale=${scaleW}:${scaleH}`,
+      '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-r', '4', 'pipe:1'
     ]);
 
     const chunks = [];
@@ -62,131 +59,161 @@ async function analyzeMotion(videoPath, startTime, endTime, vw, vh) {
 
     proc.on('close', () => {
       try {
-        const fw = 160;
-        const fh = Math.round(160 * roiH / vw);
-        const fsize = fw * fh;
+        const fw = scaleW, fh = scaleH;
+        const fsize = fw * fh * 3; // RGB
         const raw = Buffer.concat(chunks);
         const nFrames = Math.floor(raw.length / fsize);
-        if (nFrames < 2) return resolve([]);
+        if (nFrames < 1) return resolve([]);
 
         const results = [];
-        for (let i = 1; i < nFrames; i++) {
-          const prev = raw.slice((i-1)*fsize, i*fsize);
-          const curr = raw.slice(i*fsize, (i+1)*fsize);
+        // Skip scoreboard: top 10% of frame
+        const skipTop = Math.floor(fh * 0.10);
 
-          const cols = new Float32Array(fw);
-          let total = 0;
-          for (let y = 0; y < fh; y++) {
+        for (let i = 0; i < nFrames; i++) {
+          const base = i * fsize;
+          let sumX = 0, sumY = 0, count = 0;
+
+          for (let y = skipTop; y < fh; y++) {
             for (let x = 0; x < fw; x++) {
-              const d = Math.abs(curr[y*fw+x] - prev[y*fw+x]);
-              cols[x] += d;
-              total += d;
+              const idx = base + (y * fw + x) * 3;
+              const R = raw[idx], G = raw[idx+1], B = raw[idx+2];
+
+              // Detect grass: high green, low red/blue relative to green
+              // Grass hue ~100-140 deg in HSV, roughly G >> R and G >> B
+              const isGrass = G > 80 && G > R * 1.3 && G > B * 1.15 && G < 210;
+
+              if (!isGrass) {
+                sumX += x;
+                sumY += y;
+                count++;
+              }
             }
           }
 
-          const cx_norm = total > 300
-            ? (cols.reduce((s,v,x) => s + v*x, 0) / total) / fw
-            : 0.5;
-          const motion_score = total / fsize;
-
-          results.push({ t: startTime + i/5, cx_norm, motion_score });
+          const cx_norm = count > 50 ? sumX / count / fw : 0.5;
+          const cy_norm = count > 50 ? sumY / count / fh : 0.4;
+          results.push({ t: startTime + i / 4, cx_norm, cy_norm });
         }
+
         resolve(results);
-      } catch(e) { resolve([]); }
+      } catch(e) {
+        console.log('detectPlayerCentroids error:', e.message);
+        resolve([]);
+      }
     });
   });
 }
 
-// Moving average smoother
 function smooth(arr, w = 12) {
   return arr.map((_, i) => {
     const s = arr.slice(Math.max(0, i-w), i+w+1);
-    return s.reduce((a,b) => a+b, 0) / s.length;
+    return s.reduce((a, b) => a + b, 0) / s.length;
   });
 }
 
-// ─── Smart crop: 16:9 → 9:16 with dynamic pan + zoom ─────────────────────────
-//
-// Zoom logic (relative to full-height 9:16 window):
-//   motion low  → zoom 1.0x (show full pitch width in 9:16)
-//   motion high → zoom 1.4x (tighter on action)
-//
-// Pan: follows motion centroid X, smoothed to avoid jitter
-//
+// ─── Smart crop: zoom + pan XY following players ──────────────────────────────
 async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio, clipId) {
   const inputRatio = vw / vh;
 
-  // Already 9:16 — just scale
-  if (aspectRatio !== '9:16' || Math.abs(inputRatio - 9/16) < 0.05) {
-    if (aspectRatio === '16:9') return { vf: `scale=1280:720`, scFile: null };
-    if (aspectRatio === '1:1')  return { vf: `crop=${Math.min(vw,vh)}:${Math.min(vw,vh)}:${Math.floor((vw-Math.min(vw,vh))/2)}:0,scale=720:720`, scFile: null };
-    return { vf: `scale=720:1280:flags=lanczos`, scFile: null };
+  // Non 9:16 outputs: simple crop
+  if (aspectRatio === '16:9') {
+    if (Math.abs(inputRatio - 16/9) < 0.05) return { vf: 'scale=1280:720', scFile: null };
+    const cropH = Math.floor(vw * 9/16);
+    const cy = Math.floor((vh - cropH) / 2);
+    return { vf: `crop=${vw}:${cropH}:0:${cy},scale=1280:720`, scFile: null };
+  }
+  if (aspectRatio === '1:1') {
+    const s = Math.min(vw, vh);
+    return { vf: `crop=${s}:${s}:${Math.floor((vw-s)/2)}:0,scale=720:720`, scFile: null };
   }
 
-  // 16:9 → 9:16
-  // base crop window: full height, 9:16 width
-  // e.g. 1080p: 607x1080, 720p: 405x720, 360p: 202x360
-  const baseCropW = Math.floor(vh * 9 / 16);
-  const cropY     = Math.floor(vh * 0.13);   // skip scoreboard
-  const cropH     = vh - cropY;              // usable height
+  // ── 9:16 output ──────────────────────────────────────────────────────────────
+  // Two cases:
+  // A) Input is 16:9 (e.g. 1920x1080, 1280x720, 640x360) → crop 9:16 window + zoom
+  // B) Input is already 9:16 (e.g. 720x1280) → zoom + pan XY only
 
-  console.log(`  Smart crop: ${vw}x${vh} baseCropW=${baseCropW} cropH=${cropH}`);
+  const is169  = inputRatio > 1.5;    // 16:9 or wider
+  const is916  = Math.abs(inputRatio - 9/16) < 0.05;
 
-  const raw = await analyzeMotion(videoPath, startTime, endTime, vw, vh);
+  console.log(`  Input: ${vw}x${vh} ratio=${inputRatio.toFixed(2)} is169=${is169} is916=${is916}`);
 
-  // Fallback: static center crop
+  // Detect where players actually are
+  const raw = await detectPlayerCentroids(videoPath, startTime, endTime, vw, vh);
+
   if (raw.length < 3) {
-    const cx = Math.floor((vw - baseCropW) / 2);
-    return { vf: `crop=${baseCropW}:${cropH}:${cx}:${cropY},scale=720:1280:flags=lanczos`, scFile: null };
+    // Fallback: static crop
+    if (is169) {
+      const cw = Math.floor(vh * 9/16);
+      const cx = Math.floor((vw - cw) / 2);
+      return { vf: `crop=${cw}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`, scFile: null };
+    }
+    return { vf: 'scale=720:1280:flags=lanczos', scFile: null };
   }
 
-  const cx_smooth     = smooth(raw.map(r => r.cx_norm), 12);
-  const motion_smooth = smooth(raw.map(r => r.motion_score), 15);
+  const cx_s = smooth(raw.map(r => r.cx_norm), 15);
+  const cy_s = smooth(raw.map(r => r.cy_norm), 15);
+  const avgCx = cx_s.reduce((a,b)=>a+b,0)/cx_s.length;
+  const avgCy = cy_s.reduce((a,b)=>a+b,0)/cy_s.length;
+  console.log(`  Player centroid: cx=${avgCx.toFixed(2)} cy=${avgCy.toFixed(2)}`);
 
-  // Zoom range: 1.0x – 1.4x only (safe for any resolution)
-  // 1.0x = baseCropW (widest), 1.4x = baseCropW/1.4 (tightest)
-  const MIN_ZOOM = 1.0, MAX_ZOOM = 1.4;
-  // Normalize motion to zoom
-  const maxMotion = Math.max(...motion_smooth, 1);
-  const zoom_arr  = motion_smooth.map(m =>
-    MIN_ZOOM + (Math.min(m, maxMotion*0.7) / (maxMotion*0.7)) * (MAX_ZOOM - MIN_ZOOM)
-  );
-  const zoom_smooth = smooth(zoom_arr, 15);
+  // Zoom 1.5x — enough to remove empty space, not too tight
+  const ZOOM = 1.5;
 
-  // Build sendcmd keyframes
-  const lines = [];
-  for (let i = 0; i < raw.length; i++) {
-    const zoom = zoom_smooth[i];
-    const cw   = Math.max(Math.floor(baseCropW * 0.7), Math.floor(baseCropW / zoom));
-    const maxX = vw - cw;
-    const cx   = Math.max(0, Math.min(maxX, Math.floor(cx_smooth[i] * vw - cw/2)));
-    const rel  = Math.max(0, raw[i].t - startTime);
-    lines.push(`${rel.toFixed(3)} crop x ${cx};`);
-    lines.push(`${rel.toFixed(3)} crop w ${cw};`);
+  let outW, outH, cropW, cropH, lines, cw0, ch0, cx0, cy0;
+
+  if (is169) {
+    // 16:9 → 9:16: first pick 9:16 window, then zoom
+    const base9_16W = Math.floor(vh * 9 / 16);
+    cropW = Math.floor(base9_16W / ZOOM);
+    cropH = Math.floor(vh / ZOOM);
+    outW = 720; outH = 1280;
+
+    lines = [];
+    for (let i = 0; i < raw.length; i++) {
+      const maxX = vw - cropW, maxY = vh - cropH;
+      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
+      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
+      const rel = Math.max(0, raw[i].t - startTime);
+      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
+      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
+    }
+    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
+    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
+    cw0 = cropW; ch0 = cropH;
+
+  } else {
+    // Already 9:16: zoom + pan XY
+    cropW = Math.floor(vw / ZOOM);
+    cropH = Math.floor(vh / ZOOM);
+    outW = vw; outH = vh;
+
+    lines = [];
+    for (let i = 0; i < raw.length; i++) {
+      const maxX = vw - cropW, maxY = vh - cropH;
+      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
+      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
+      const rel = Math.max(0, raw[i].t - startTime);
+      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
+      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
+    }
+    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
+    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
+    cw0 = cropW; ch0 = cropH;
   }
-
-  // Initial values from first frame
-  const z0  = zoom_smooth[0];
-  const cw0 = Math.max(Math.floor(baseCropW * 0.7), Math.floor(baseCropW / z0));
-  const cx0 = Math.max(0, Math.min(vw - cw0, Math.floor(cx_smooth[0] * vw - cw0/2)));
-
-  const avgZoom = zoom_smooth.reduce((a,b)=>a+b,0)/zoom_smooth.length;
-  const avgCx   = cx_smooth.reduce((a,b)=>a+b,0)/cx_smooth.length;
-  console.log(`  avg_zoom=${avgZoom.toFixed(2)}x  avg_cx=${avgCx.toFixed(2)}  samples=${raw.length}`);
 
   const scPath = path.join(TMP_DIR, `${clipId}_sc.txt`);
   await writeFile(scPath, lines.join('\n'));
 
   const vf = [
     `sendcmd=f='${scPath}'`,
-    `crop=${cw0}:${cropH}:${cx0}:${cropY}`,
-    `scale=720:1280:flags=lanczos`
+    `crop=${cw0}:${ch0}:${cx0}:${cy0}`,
+    `scale=${outW}:${outH}:flags=lanczos`
   ].join(',');
 
   return { vf, scFile: scPath };
 }
 
-// ─── Express app ───────────────────────────────────────────────────────────────
+// ─── Express ──────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -211,25 +238,18 @@ app.post('/mode1', async (req, res) => {
 });
 
 async function ytdlpDownload(url, outputPath) {
-  // Auto-update yt-dlp to handle YouTube API changes
   try { await execFileAsync('yt-dlp', ['-U'], { timeout: 30000 }); console.log('yt-dlp updated'); }
   catch { console.log('yt-dlp update skipped'); }
 
   const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath];
   const strategies = [
-    // Strategy 1: android + 1080p
     ['--extractor-args', 'youtube:player_client=android',
      '--format', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best',
      '--merge-output-format', 'mp4', ...base, url],
-    // Strategy 2: ios client
     ['--extractor-args', 'youtube:player_client=ios',
-     '--format', 'best[ext=mp4][height<=1080]/best[ext=mp4][height<=720]/best',
-     ...base, url],
-    // Strategy 3: tv_embedded (bypasses some restrictions)
+     '--format', 'best[ext=mp4][height<=1080]/best[ext=mp4][height<=720]/best', ...base, url],
     ['--extractor-args', 'youtube:player_client=tv_embedded',
-     '--format', 'best[height<=1080]/best[height<=720]/best',
-     ...base, url],
-    // Strategy 4: web last resort
+     '--format', 'best[height<=1080]/best[height<=720]/best', ...base, url],
     ['--format', 'best[height<=720]/best', ...base, url],
   ];
   let lastError;
@@ -250,8 +270,8 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
   if (isYoutube) await ytdlpDownload(inputUrl, videoPath);
   else await execFileAsync('curl', ['-L', '-o', videoPath, inputUrl], { timeout: 120000 });
 
-  const { width: vw, height: vh, fps } = await getVideoDimensions(videoPath);
-  console.log(`Video: ${vw}x${vh} @ ${fps}fps`);
+  const { width: vw, height: vh } = await getVideoDimensions(videoPath);
+  console.log(`Video: ${vw}x${vh}`);
 
   set({ progress: 30, step: 'extracting_audio' });
   await execFileAsync('ffmpeg', [
@@ -276,10 +296,7 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: `You are a viral sports video editor. Pick 3-5 best highlight clips.
-RULES:
-- Each clip minimum 6 seconds, maximum 45 seconds
-- End at natural stopping point (after goal, applause, sentence end)
-- Start 1-2s before action begins
+RULES: min 6s, max 45s per clip. End at natural stopping point. Start 1-2s before action.
 Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}` },
       { role: 'user', content: `Find highlights:\n${segText}` }
     ],
@@ -290,13 +307,12 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
   highlights = highlights.map(h => {
     if (h.end - h.start < 6)  h.end = h.start + 6;
     if (h.end - h.start > 45) h.end = h.start + 45;
-    h.end = h.end + 2;
+    h.end += 2;
     return h;
   });
 
   set({ progress: 75, step: 'cutting_clips' });
-  const clips = [];
-  const scFiles = [];
+  const clips = [], scFiles = [];
 
   for (let i = 0; i < highlights.length; i++) {
     const h = highlights[i];
@@ -315,8 +331,7 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
       '-vf', vf,
       '-c:v', 'libx264', '-c:a', 'aac',
       '-preset', 'fast', '-crf', '23',
-      '-movflags', '+faststart',
-      '-y', clipPath
+      '-movflags', '+faststart', '-y', clipPath
     ], { timeout: 180000 });
 
     clips.push({
@@ -328,13 +343,11 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
       viral_score: h.viral_score || 5,
       aspectRatio,
     });
-
     set({ progress: 75 + Math.floor((i+1) / highlights.length * 20) });
   }
 
   try { await unlink(videoPath); await unlink(audioPath); } catch {}
   for (const f of scFiles) { try { await unlink(f); } catch {} }
-
   jobs.set(jobId, { jobId, status: 'done', progress: 100, clips, completedAt: Date.now() });
 }
 
