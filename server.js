@@ -21,6 +21,13 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const jobs = new Map();
 
+// Aspect ratio crop filters for ffmpeg
+const ASPECT_FILTERS = {
+  '9:16': 'crop=ih*9/16:ih,scale=1080:1920',   // vertical — TikTok/Reels/Shorts
+  '16:9': 'crop=iw:iw*9/16,scale=1920:1080',   // horizontal — YouTube
+  '1:1':  'crop=ih:ih,scale=1080:1080',         // square — Instagram
+};
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -34,12 +41,12 @@ app.get('/status/:jobId', (req, res) => {
 });
 
 app.post('/mode1', async (req, res) => {
-  const { youtubeUrl, videoUrl } = req.body;
+  const { youtubeUrl, videoUrl, aspectRatio = '9:16' } = req.body;
   if (!youtubeUrl && !videoUrl) return res.status(400).json({ error: 'youtubeUrl or videoUrl required' });
   const jobId = `mode1_${randomUUID()}`;
   jobs.set(jobId, { jobId, status: 'processing', progress: 0, clips: [] });
   res.json({ jobId });
-  processMode1(jobId, youtubeUrl || videoUrl).catch(err => {
+  processMode1(jobId, youtubeUrl || videoUrl, aspectRatio).catch(err => {
     jobs.set(jobId, { jobId, status: 'failed', error: err.message, clips: [], failedAt: Date.now() });
   });
 });
@@ -69,12 +76,15 @@ async function ytdlpDownload(url, outputPath) {
   throw new Error(`All yt-dlp strategies failed: ${lastError.message.slice(0, 200)}`);
 }
 
-async function processMode1(jobId, inputUrl) {
+async function processMode1(jobId, inputUrl, aspectRatio) {
   const set = (update) => jobs.set(jobId, { ...jobs.get(jobId), ...update });
 
   const videoPath = path.join(TMP_DIR, `${jobId}.mp4`);
   const audioPath = path.join(TMP_DIR, `${jobId}.mp3`);
   const isYoutube = /youtube\.com|youtu\.be/.test(inputUrl);
+  const cropFilter = ASPECT_FILTERS[aspectRatio] || ASPECT_FILTERS['9:16'];
+
+  console.log(`Processing job ${jobId} | aspectRatio: ${aspectRatio} | filter: ${cropFilter}`);
 
   // Step 1: Download
   set({ progress: 10, step: 'downloading' });
@@ -101,7 +111,7 @@ async function processMode1(jobId, inputUrl) {
     timestamp_granularities: ['segment'],
   });
 
-  // Step 4: GPT-4o-mini analyze — enforce min 20s, max 45s
+  // Step 4: GPT-4o-mini analyze
   set({ progress: 65, step: 'analyzing' });
   const segments = transcription.segments || [];
   const segText = segments.map(s => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}s] ${s.text}`).join('\n');
@@ -113,32 +123,27 @@ async function processMode1(jobId, inputUrl) {
       {
         role: 'system',
         content: `You are a viral video editor. Pick 3-5 best highlight clips.
-STRICT RULES:
-- Each clip MUST be minimum 6 seconds long (end - start >= 6)
-- Each clip MUST be maximum 60 seconds long (end - start <= 60)
-- If a segment is too short, extend it slightly
+RULES:
+- Each clip minimum 6 seconds (end - start >= 6)
+- Each clip maximum 60 seconds (end - start <= 60)
 - Never return a clip shorter than 6 seconds
 Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}`
       },
-      { role: 'user', content: `Find highlights from this transcript:\n${segText}` }
+      { role: 'user', content: `Find highlights:\n${segText}` }
     ],
     max_tokens: 1000,
   });
 
   let { highlights = [] } = JSON.parse(gptRes.choices[0].message.content);
 
-  // Safety: enforce min 20s duration
+  // Safety: enforce duration
   highlights = highlights.map(h => {
-    if (h.end - h.start < 6) {
-      h.end = h.start + 6;
-    }
-    if (h.end - h.start > 60) {
-      h.end = h.start + 60;
-    }
+    if (h.end - h.start < 6) h.end = h.start + 6;
+    if (h.end - h.start > 60) h.end = h.start + 60;
     return h;
   });
 
-  // Step 5: Cut clips — re-encode for browser compatibility
+  // Step 5: Cut + crop clips
   set({ progress: 75, step: 'cutting_clips' });
   const clips = [];
 
@@ -147,16 +152,16 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const clipId = `${jobId}_clip${i + 1}`;
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
 
-    // Re-encode to H.264/AAC for universal browser support
     await execFileAsync('ffmpeg', [
       '-i', videoPath,
       '-ss', String(h.start),
       '-to', String(h.end),
-      '-c:v', 'libx264',    // H.264 video — plays in all browsers
-      '-c:a', 'aac',        // AAC audio — plays in all browsers
+      '-vf', cropFilter,          // crop to aspect ratio
+      '-c:v', 'libx264',
+      '-c:a', 'aac',
       '-preset', 'fast',
       '-crf', '23',
-      '-movflags', '+faststart',  // optimize for web streaming
+      '-movflags', '+faststart',
       '-y', clipPath
     ], { timeout: 120000 });
 
@@ -168,6 +173,7 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
       end: h.end,
       duration: Math.round(h.end - h.start),
       viral_score: h.viral_score || 5,
+      aspectRatio,
     });
 
     set({ progress: 75 + Math.floor((i + 1) / highlights.length * 20) });
