@@ -248,3 +248,4 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
 }
 
 app.listen(PORT, () => console.log(`ClipThai backend listening on :${PORT}`));
+// force update Mon Jun 22 19:59:20 +07 2026
