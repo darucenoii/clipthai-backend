@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, mkdirSync } from 'fs';
 import { unlink, readFile } from 'fs/promises';
@@ -21,114 +21,77 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const jobs = new Map();
 
-// Aspect ratio crop filters for ffmpeg
-// Analyze motion to find the most active x-position in video
-async function getMotionCropX(videoPath, targetWidth, videoWidth) {
-  try {
-    const { stdout } = await new Promise((resolve, reject) => {
-      const ffmpeg = require('child_process').spawn('ffmpeg', [
-        '-i', videoPath,
-        '-vf', 'mestimate=method=epzs:mb_size=16:search_param=7,metadata=print:file=-',
-        '-frames:v', '60',  // analyze first 60 frames
-        '-f', 'null', '-'
-      ]);
-      let out = '';
-      ffmpeg.stderr.on('data', d => out += d.toString());
-      ffmpeg.on('close', code => resolve({ stdout: out }));
-      ffmpeg.on('error', reject);
-    });
-
-    // Parse motion vectors to find active region
-    const matches = [...stdout.matchAll(/MV_x=([+-]?\d+\.?\d*)/g)];
-    if (matches.length === 0) return Math.floor((videoWidth - targetWidth) / 2);
-
-    const avgX = matches.reduce((sum, m) => sum + Math.abs(parseFloat(m[1])), 0) / matches.length;
-    const centerX = Math.min(Math.max(Math.floor(videoWidth / 2 + avgX - targetWidth / 2), 0), videoWidth - targetWidth);
-    return centerX;
-  } catch {
-    return Math.floor((videoWidth - targetWidth) / 2); // fallback to center
-  }
-}
-
+// Get video dimensions
 async function getVideoDimensions(videoPath) {
   try {
-    const { stderr } = await execFileAsync('ffprobe', [
+    const result = await execFileAsync('ffprobe', [
       '-v', 'error', '-select_streams', 'v:0',
       '-show_entries', 'stream=width,height',
       '-of', 'csv=p=0', videoPath
     ]);
-    const [w, h] = stderr.split(',').map(Number);
+    const out = (result.stdout || result.stderr || '640,360').trim();
+    const [w, h] = out.split(',').map(Number);
     return { width: w || 640, height: h || 360 };
   } catch {
     return { width: 640, height: 360 };
   }
 }
 
-async function buildCropFilter(aspectRatio, videoPath) {
-  try {
-    // Get video dimensions via ffprobe stdout
-    const result = await execFileAsync('ffprobe', [
-      '-v', 'error', '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height',
-      '-of', 'csv=p=0', videoPath
+// Analyze motion in a specific time range and return best crop X position
+async function getSmartCropX(videoPath, startTime, endTime, targetWidth, videoWidth) {
+  return new Promise((resolve) => {
+    const duration = Math.min(endTime - startTime, 10); // analyze up to 10s of clip
+    const defaultX = Math.floor((videoWidth - targetWidth) / 2);
+
+    const proc = spawn('ffmpeg', [
+      '-ss', String(startTime),
+      '-t', String(duration),
+      '-i', videoPath,
+      '-vf', 'mestimate=method=epzs:mb_size=16,metadata=print:file=-',
+      '-an', '-f', 'null', '/dev/null'
     ]);
-    const parts = (result.stdout || result.stderr || '640,360').trim().split(',');
-    const vw = parseInt(parts[0]) || 640;
-    const vh = parseInt(parts[1]) || 360;
 
-    if (aspectRatio === '16:9') {
-      return `scale=1280:720`;
-    }
+    let stderr = '';
+    proc.stderr.on('data', d => stderr += d.toString());
+    proc.on('close', () => {
+      try {
+        // Parse motion vectors
+        const matches = [...stderr.matchAll(/MV_x=([+-]?\d+\.?\d*)/g)];
+        if (matches.length < 5) return resolve(defaultX);
 
-    if (aspectRatio === '1:1') {
-      // crop square from center
-      const size = Math.min(vw, vh);
-      const x = Math.floor((vw - size) / 2);
-      const y = Math.floor((vh - size) / 2);
-      return `crop=${size}:${size}:${x}:${y},scale=720:720`;
-    }
+        // Build histogram of x positions with high motion
+        const xCounts = {};
+        matches.forEach(m => {
+          const mv = parseFloat(m[1]);
+          if (Math.abs(mv) < 2) return; // ignore tiny motion
+          // convert motion vector to approximate screen x region
+          const bucket = Math.floor((mv + videoWidth) / 32) * 32;
+          xCounts[bucket] = (xCounts[bucket] || 0) + 1;
+        });
 
-    // 9:16 — smart motion crop
-    const targetW = Math.floor(vh * 9 / 16);
-    if (targetW >= vw) {
-      // video is already narrow — just scale
-      return `scale=720:1280`;
-    }
+        if (Object.keys(xCounts).length === 0) return resolve(defaultX);
 
-    // analyze motion to find best x crop position
-    let cropX = Math.floor((vw - targetW) / 2); // default center
-    try {
-      const probe = await execFileAsync('ffprobe', [
-        '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height',
-        '-of', 'json', videoPath
-      ]);
-      // Use ffmpeg to get motion info from first 3 seconds
-      const motionResult = await execFileAsync('ffmpeg', [
-        '-i', videoPath,
-        '-t', '3',
-        '-vf', `mestimate=method=epzs:mb_size=16,metadata=print:file=-`,
-        '-an', '-f', 'null', '/dev/null'
-      ], { timeout: 15000 });
+        // Find x bucket with most motion
+        const maxBucket = Object.entries(xCounts).sort((a, b) => b[1] - a[1])[0][0];
+        const motionX = parseInt(maxBucket);
 
-      const mvMatches = [...(motionResult.stderr || '').matchAll(/MV_x=([+-]?\d+\.?\d*)/g)];
-      if (mvMatches.length > 0) {
-        const avgMVX = mvMatches.reduce((s, m) => s + parseFloat(m[1]), 0) / mvMatches.length;
-        // shift crop toward where motion is happening
-        cropX = Math.min(
-          Math.max(Math.floor(vw / 2 + avgMVX * 2 - targetW / 2), 0),
-          vw - targetW
+        // Calculate crop x — center around motion region
+        const cropX = Math.min(
+          Math.max(Math.floor(motionX - targetWidth / 2), 0),
+          videoWidth - targetWidth
         );
-      }
-    } catch {
-      // keep center crop as fallback
-    }
 
-    return `crop=${targetW}:${vh}:${cropX}:0,scale=720:1280`;
-  } catch {
-    // ultimate fallback
-    return aspectRatio === '1:1' ? 'crop=ih:ih:(iw-ih)/2:0,scale=720:720' : 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=720:1280';
-  }
+        console.log(`Smart crop: motion at x=${motionX}, cropX=${cropX} (video=${videoWidth}, target=${targetWidth})`);
+        resolve(cropX);
+      } catch {
+        resolve(defaultX);
+      }
+    });
+    proc.on('error', () => resolve(defaultX));
+
+    // Timeout fallback
+    setTimeout(() => resolve(defaultX), 12000);
+  });
 }
 
 const app = express();
@@ -186,8 +149,6 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
   const audioPath = path.join(TMP_DIR, `${jobId}.mp3`);
   const isYoutube = /youtube\.com|youtu\.be/.test(inputUrl);
 
-  console.log(`Processing job ${jobId} | aspectRatio: ${aspectRatio}`);
-
   // Step 1: Download
   set({ progress: 10, step: 'downloading' });
   if (isYoutube) {
@@ -195,6 +156,10 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
   } else {
     await execFileAsync('curl', ['-L', '-o', videoPath, inputUrl], { timeout: 120000 });
   }
+
+  // Get video dimensions for smart crop
+  const { width: vw, height: vh } = await getVideoDimensions(videoPath);
+  console.log(`Video dimensions: ${vw}x${vh}`);
 
   // Step 2: Extract audio
   set({ progress: 30, step: 'extracting_audio' });
@@ -228,7 +193,6 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
 RULES:
 - Each clip minimum 6 seconds (end - start >= 6)
 - Each clip maximum 60 seconds (end - start <= 60)
-- Never return a clip shorter than 6 seconds
 Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}`
       },
       { role: 'user', content: `Find highlights:\n${segText}` }
@@ -237,18 +201,14 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
   });
 
   let { highlights = [] } = JSON.parse(gptRes.choices[0].message.content);
-
-  // Safety: enforce duration
   highlights = highlights.map(h => {
     if (h.end - h.start < 6) h.end = h.start + 6;
     if (h.end - h.start > 60) h.end = h.start + 60;
     return h;
   });
 
-  // Step 5: Cut + crop clips — build smart crop filter from downloaded video
+  // Step 5: Cut + smart crop each clip individually
   set({ progress: 75, step: 'cutting_clips' });
-  const cropFilter = await buildCropFilter(aspectRatio, videoPath);
-  console.log(`Smart crop filter: ${cropFilter}`);
   const clips = [];
 
   for (let i = 0; i < highlights.length; i++) {
@@ -256,11 +216,34 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const clipId = `${jobId}_clip${i + 1}`;
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
 
+    let vfFilter;
+
+    if (aspectRatio === '16:9') {
+      vfFilter = `scale=1280:720`;
+    } else if (aspectRatio === '1:1') {
+      const size = Math.min(vw, vh);
+      const x = Math.floor((vw - size) / 2);
+      const y = Math.floor((vh - size) / 2);
+      vfFilter = `crop=${size}:${size}:${x}:${y},scale=720:720`;
+    } else {
+      // 9:16 — smart motion crop per clip
+      const targetW = Math.floor(vh * 9 / 16);
+      if (targetW >= vw) {
+        vfFilter = `scale=720:1280`;
+      } else {
+        // analyze motion in THIS clip's time range
+        const cropX = await getSmartCropX(videoPath, h.start, h.end, targetW, vw);
+        vfFilter = `crop=${targetW}:${vh}:${cropX}:0,scale=720:1280`;
+      }
+    }
+
+    console.log(`Clip ${i+1} [${h.start}-${h.end}s] filter: ${vfFilter}`);
+
     await execFileAsync('ffmpeg', [
       '-i', videoPath,
       '-ss', String(h.start),
       '-to', String(h.end),
-      '-vf', cropFilter,          // crop to aspect ratio
+      '-vf', vfFilter,
       '-c:v', 'libx264',
       '-c:a', 'aac',
       '-preset', 'fast',
@@ -273,8 +256,7 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
       url: `${PUBLIC_BASE_URL}/outputs/${clipId}.mp4`,
       title: h.title || `Clip ${i + 1}`,
       keyword: h.keyword || '',
-      start: h.start,
-      end: h.end,
+      start: h.start, end: h.end,
       duration: Math.round(h.end - h.start),
       viral_score: h.viral_score || 5,
       aspectRatio,
@@ -284,7 +266,6 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
   }
 
   try { await unlink(videoPath); await unlink(audioPath); } catch {}
-
   jobs.set(jobId, { jobId, status: 'done', progress: 100, clips, completedAt: Date.now() });
 }
 
