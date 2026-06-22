@@ -238,10 +238,23 @@ app.post('/mode1', async (req, res) => {
 });
 
 async function ytdlpDownload(url, outputPath) {
+  // Auto-update yt-dlp
   try { await execFileAsync('yt-dlp', ['-U'], { timeout: 30000 }); console.log('yt-dlp updated'); }
   catch { console.log('yt-dlp update skipped'); }
 
-  const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath];
+  // Write cookies file from env variable if available
+  let cookiesArg = [];
+  if (process.env.YOUTUBE_COOKIES_BASE64) {
+    try {
+      const cookiesPath = path.join(TMP_DIR, 'yt_cookies.txt');
+      const cookiesContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf8');
+      await writeFile(cookiesPath, cookiesContent);
+      cookiesArg = ['--cookies', cookiesPath];
+      console.log('Using YouTube cookies');
+    } catch(e) { console.log('Cookies setup failed:', e.message); }
+  }
+
+  const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath, ...cookiesArg];
   const strategies = [
     ['--extractor-args', 'youtube:player_client=android',
      '--format', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best',
