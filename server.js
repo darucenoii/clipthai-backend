@@ -115,39 +115,41 @@ function smooth(arr, w = 12) {
 async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio, clipId) {
   const inputRatio = vw / vh;
 
-  // Non 9:16 outputs: simple crop
+  // 16:9 output: simple crop
   if (aspectRatio === '16:9') {
     if (Math.abs(inputRatio - 16/9) < 0.05) return { vf: 'scale=1280:720', scFile: null };
     const cropH = Math.floor(vw * 9/16);
     const cy = Math.floor((vh - cropH) / 2);
     return { vf: `crop=${vw}:${cropH}:0:${cy},scale=1280:720`, scFile: null };
   }
-  if (aspectRatio === '1:1') {
-    const s = Math.min(vw, vh);
-    return { vf: `crop=${s}:${s}:${Math.floor((vw-s)/2)}:0,scale=720:720`, scFile: null };
-  }
 
-  // ── 9:16 output ──────────────────────────────────────────────────────────────
-  // Two cases:
-  // A) Input is 16:9 (e.g. 1920x1080, 1280x720, 640x360) → crop 9:16 window + zoom
-  // B) Input is already 9:16 (e.g. 720x1280) → zoom + pan XY only
+  // ── Smart zoom + pan for all portrait/square outputs ──────────────────────────
+  // Handles: 16:9→9:16, 9:16→9:16(zoom), 1:1→9:16(zoom), 1:1→1:1(zoom)
+  const is169 = inputRatio > 1.5;
+  const is11  = Math.abs(inputRatio - 1.0) < 0.05;
 
-  const is169  = inputRatio > 1.5;    // 16:9 or wider
-  const is916  = Math.abs(inputRatio - 9/16) < 0.05;
-
-  console.log(`  Input: ${vw}x${vh} ratio=${inputRatio.toFixed(2)} is169=${is169} is916=${is916}`);
+  console.log(`  Input: ${vw}x${vh} ratio=${inputRatio.toFixed(2)} is169=${is169} is11=${is11}`);
 
   // Detect where players actually are
   const raw = await detectPlayerCentroids(videoPath, startTime, endTime, vw, vh);
 
+  // Output dimensions
+  const outW = aspectRatio === '9:16' ? 720 : 720;
+  const outH = aspectRatio === '9:16' ? 1280 : 720;
+
   if (raw.length < 3) {
-    // Fallback: static crop
+    // Fallback: static center crop with zoom
     if (is169) {
       const cw = Math.floor(vh * 9/16);
       const cx = Math.floor((vw - cw) / 2);
-      return { vf: `crop=${cw}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`, scFile: null };
+      return { vf: `crop=${cw}:${vh}:${cx}:0,scale=${outW}:${outH}:flags=lanczos`, scFile: null };
     }
-    return { vf: 'scale=720:1280:flags=lanczos', scFile: null };
+    // Square or portrait: zoom 1.5x center
+    const cw = Math.floor(vw / 1.5);
+    const ch = Math.floor(vh / 1.5);
+    const cx = Math.floor((vw - cw) / 2);
+    const cy = Math.floor((vh - ch) / 2);
+    return { vf: `crop=${cw}:${ch}:${cx}:${cy},scale=${outW}:${outH}:flags=lanczos`, scFile: null };
   }
 
   const cx_s = smooth(raw.map(r => r.cx_norm), 15);
@@ -156,50 +158,34 @@ async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio
   const avgCy = cy_s.reduce((a,b)=>a+b,0)/cy_s.length;
   console.log(`  Player centroid: cx=${avgCx.toFixed(2)} cy=${avgCy.toFixed(2)}`);
 
-  // Zoom 1.5x — enough to remove empty space, not too tight
-  const ZOOM = 1.5;
+  // Zoom level: 1.5x for portrait, 1.8x for square (more empty space)
+  const ZOOM = is11 ? 1.8 : 1.5;
 
-  let outW, outH, cropW, cropH, lines, cw0, ch0, cx0, cy0;
+  let cropW, cropH, cw0, ch0, cx0, cy0;
 
   if (is169) {
-    // 16:9 → 9:16: first pick 9:16 window, then zoom
-    const base9_16W = Math.floor(vh * 9 / 16);
-    cropW = Math.floor(base9_16W / ZOOM);
+    // 16:9 → 9:16: crop 9:16 window first, then zoom
+    const base916W = Math.floor(vh * 9 / 16);
+    cropW = Math.floor(base916W / ZOOM);
     cropH = Math.floor(vh / ZOOM);
-    outW = 720; outH = 1280;
-
-    lines = [];
-    for (let i = 0; i < raw.length; i++) {
-      const maxX = vw - cropW, maxY = vh - cropH;
-      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
-      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
-      const rel = Math.max(0, raw[i].t - startTime);
-      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
-      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
-    }
-    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
-    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
-    cw0 = cropW; ch0 = cropH;
-
   } else {
-    // Already 9:16: zoom + pan XY
+    // Square or portrait: zoom into player position
     cropW = Math.floor(vw / ZOOM);
     cropH = Math.floor(vh / ZOOM);
-    outW = vw; outH = vh;
-
-    lines = [];
-    for (let i = 0; i < raw.length; i++) {
-      const maxX = vw - cropW, maxY = vh - cropH;
-      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
-      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
-      const rel = Math.max(0, raw[i].t - startTime);
-      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
-      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
-    }
-    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
-    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
-    cw0 = cropW; ch0 = cropH;
   }
+
+  const lines = [];
+  for (let i = 0; i < raw.length; i++) {
+    const maxX = vw - cropW, maxY = vh - cropH;
+    const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
+    const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
+    const rel = Math.max(0, raw[i].t - startTime);
+    lines.push(`${rel.toFixed(3)} crop x ${cx};`);
+    lines.push(`${rel.toFixed(3)} crop y ${cy};`);
+  }
+  cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
+  cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
+  cw0 = cropW; ch0 = cropH;
 
   const scPath = path.join(TMP_DIR, `${clipId}_sc.txt`);
   await writeFile(scPath, lines.join('\n'));
