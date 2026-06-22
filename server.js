@@ -264,11 +264,7 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const duration = h.end - h.start;
 
     const highMotion = await hasHighMotion(videoPath, h.start, h.end);
-    // Only use Vision when converting wide (16:9) to vertical (9:16) — most expensive crop
-    const inputRatio = vw / vh;
-    const needsVision = aspectRatio === '9:16' && inputRatio > 1.2;
-    const position = needsVision ? await detectActionPosition(videoPath, h.start, h.end) : 'center';
-    const vfFilter = buildVfFilter(aspectRatio, vw, vh, highMotion, position);
+    const vfFilter = buildVfFilter(aspectRatio, vw, vh, highMotion, 'center');
     console.log(`Clip ${i+1} [${h.start}-${h.end}s] highMotion=${highMotion}`);
 
     await execFileAsync('ffmpeg', [
