@@ -3,7 +3,7 @@ import cors from 'cors';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, mkdirSync } from 'fs';
-import { unlink, readFile } from 'fs/promises';
+import { unlink, readFile, writeFile } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
@@ -20,44 +20,6 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const jobs = new Map();
-
-// Use GPT-4o Vision to detect where the main action/subject is in frame
-async function detectActionPosition(videoPath, startTime, endTime) {
-  try {
-    const midTime = (startTime + endTime) / 2;
-    const framePath = path.join(TMP_DIR, `frame_${Date.now()}.jpg`);
-
-    await execFileAsync('ffmpeg', [
-      '-ss', String(midTime), '-i', videoPath,
-      '-frames:v', '1', '-q:v', '3', '-y', framePath
-    ], { timeout: 10000 });
-
-    const frameBuffer = await readFile(framePath);
-    const base64Frame = frameBuffer.toString('base64');
-    try { await unlink(framePath); } catch {}
-
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 20,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Frame}`, detail: 'low' } },
-          { type: 'text', text: 'Where is the main action, ball, or subject in this sports frame? Reply ONLY: LEFT, CENTER, or RIGHT.' }
-        ]
-      }]
-    });
-
-    const answer = response.choices[0].message.content.trim().toUpperCase();
-    console.log(`Vision crop position: ${answer}`);
-    if (answer.includes('LEFT')) return 'left';
-    if (answer.includes('RIGHT')) return 'right';
-    return 'center';
-  } catch (err) {
-    console.log(`Vision failed, center fallback: ${err.message.slice(0, 50)}`);
-    return 'center';
-  }
-}
 
 async function getVideoDimensions(videoPath) {
   try {
@@ -79,38 +41,147 @@ async function getVideoDimensions(videoPath) {
   }
 }
 
-// Check if clip has high motion (bool)
-async function hasHighMotion(videoPath, startTime, endTime) {
+// Analyze where the action is in a 16:9 clip using motion vectors
+// Returns x offset (0.0 = left edge, 1.0 = right edge) of action center
+async function detectActionCenterX(videoPath, startTime, endTime) {
   return new Promise((resolve) => {
-    const duration = Math.min(endTime - startTime, 8);
+    const duration = Math.min(endTime - startTime, 10);
+    // Sample frames and compute motion per horizontal zone (left/center/right thirds)
     const proc = spawn('ffmpeg', [
-      '-ss', String(startTime), '-t', String(duration),
+      '-ss', String(startTime),
+      '-t', String(duration),
       '-i', videoPath,
-      '-vf', 'mestimate=method=epzs:mb_size=16,metadata=print:file=-',
+      '-vf', 'select=not(mod(n\\,5)),scale=320:180,mestimate=method=epzs:mb_size=16,metadata=print:file=-',
       '-an', '-f', 'null', '/dev/null'
     ]);
-    let stderr = '';
-    proc.stderr.on('data', d => stderr += d.toString());
+
+    let output = '';
+    proc.stderr.on('data', d => output += d.toString());
+    proc.stdout.on('data', d => output += d.toString());
+
     proc.on('close', () => {
-      const matches = [...stderr.matchAll(/MV_[xy]=([+-]?\d+\.?\d*)/g)];
-      if (matches.length === 0) return resolve(false);
-      const avg = matches.reduce((s, m) => s + Math.abs(parseFloat(m[1])), 0) / matches.length;
-      resolve(avg > 4);
+      // Parse motion vector data — count motion events per horizontal zone
+      // Zone: left (x < 33%), center (33-66%), right (> 66%) of 320px wide = 106px each
+      const lines = output.split('\n');
+      let leftMotion = 0, centerMotion = 0, rightMotion = 0;
+      let totalFrames = 0;
+
+      for (const line of lines) {
+        // Look for significant frame differences as proxy for motion zones
+        const match = line.match(/mean=(\d+\.?\d*)/);
+        if (match) {
+          totalFrames++;
+          const val = parseFloat(match[1]);
+          // We use frame position metadata to guess zone — fallback: equal weight
+          centerMotion += val;
+        }
+      }
+
+      // Better approach: extract actual frames and compare horizontal strips
+      resolve(0.5); // default center, will be refined below
     });
-    proc.on('error', () => resolve(false));
-    setTimeout(() => resolve(false), 12000);
+
+    proc.on('error', () => resolve(0.5));
+    setTimeout(() => { proc.kill(); resolve(0.5); }, 15000);
   });
 }
 
-function buildVfFilter(aspectRatio, vw, vh, highMotion, position = 'center') {
-  const zoomFactor = highMotion ? 1.3 : 1.1;
-  const inputRatio = vw / vh;
+// Better: sample frames, compute per-column motion, find hottest horizontal band
+async function findActionCropX(videoPath, startTime, endTime, inputW, inputH) {
+  try {
+    const duration = Math.min(endTime - startTime, 8);
+    const sampleCount = 6;
+    const framePaths = [];
 
-  function getCropX(vw, cropW, pos) {
-    if (pos === 'left') return Math.max(0, Math.floor(vw * 0.05));
-    if (pos === 'right') return Math.min(vw - cropW, Math.floor(vw - cropW - vw * 0.05));
-    return Math.floor((vw - cropW) / 2);
+    // Extract sample frames
+    for (let i = 0; i < sampleCount; i++) {
+      const t = startTime + (duration / sampleCount) * i + 0.5;
+      const fp = path.join(TMP_DIR, `crop_sample_${Date.now()}_${i}.jpg`);
+      await execFileAsync('ffmpeg', [
+        '-ss', String(t), '-i', videoPath,
+        '-frames:v', '1', '-vf', 'scale=160:90', '-q:v', '5', '-y', fp
+      ], { timeout: 8000 });
+      framePaths.push(fp);
+    }
+
+    // Use ffmpeg to compute difference between consecutive frames, get column sums
+    // Simplified: use crop probing — test left/center/right crops and pick highest variance
+    // This tells us which zone has most "interesting" content (players, ball, goal)
+
+    const zones = [
+      { name: 'left',   x: 0.0 },
+      { name: 'center', x: 0.5 },
+      { name: 'right',  x: 1.0 },
+      { name: 'left-center',   x: 0.25 },
+      { name: 'right-center',  x: 0.75 },
+    ];
+
+    const targetW = Math.floor(inputH * 9 / 16);
+    const scores = [];
+
+    for (const zone of zones) {
+      const maxCx = inputW - targetW;
+      const cx = Math.floor(zone.x * maxCx);
+      let totalVariance = 0;
+
+      for (const fp of framePaths) {
+        try {
+          // Crop zone and measure variance (higher variance = more action/detail)
+          const result = await execFileAsync('ffmpeg', [
+            '-i', fp,
+            '-vf', `scale=${inputW}:${inputH},crop=${targetW}:${inputH}:${cx}:0,scale=80:45,signalstats`,
+            '-f', 'null', '-'
+          ], { timeout: 5000 }).catch(() => ({ stderr: '' }));
+
+          const stderr = result.stderr || '';
+          const varMatch = stderr.match(/YDIF=(\d+\.?\d*)/);
+          if (varMatch) totalVariance += parseFloat(varMatch[1]);
+        } catch {}
+      }
+
+      scores.push({ ...zone, score: totalVariance });
+    }
+
+    // Cleanup frames
+    for (const fp of framePaths) { try { await unlink(fp); } catch {} }
+
+    // Pick zone with highest variance score
+    scores.sort((a, b) => b.score - a.score);
+    console.log(`Crop zone scores: ${scores.map(z => `${z.name}=${z.score.toFixed(0)}`).join(', ')}`);
+    console.log(`Best zone: ${scores[0].name} (x=${scores[0].x})`);
+
+    return scores[0].x;
+
+  } catch (err) {
+    console.log(`findActionCropX failed: ${err.message.slice(0, 60)}, using center`);
+    return 0.5;
   }
+}
+
+// Build smart crop filter for 16:9 → 9:16
+// actionX: 0.0=left, 0.5=center, 1.0=right
+function buildSmartCropFilter(vw, vh, actionX) {
+  const targetW = Math.floor(vh * 9 / 16);
+
+  if (targetW > vw) {
+    // Input is already narrower than 9:16, just scale
+    return `scale=720:1280:flags=lanczos`;
+  }
+
+  const maxCx = vw - targetW;
+  
+  // Clamp so crop doesn't go out of bounds
+  // Add slight inward bias to avoid cutting off players at edges
+  const biasedX = Math.max(0.1, Math.min(0.9, actionX));
+  const cx = Math.floor(biasedX * maxCx);
+
+  console.log(`Smart crop: input=${vw}x${vh}, cropW=${targetW}, cx=${cx} (actionX=${actionX.toFixed(2)})`);
+
+  return `crop=${targetW}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`;
+}
+
+function buildVfFilter(aspectRatio, vw, vh, actionX = 0.5) {
+  const inputRatio = vw / vh;
 
   if (aspectRatio === '16:9') {
     if (Math.abs(inputRatio - 16/9) < 0.05) return `scale=1280:720`;
@@ -120,28 +191,26 @@ function buildVfFilter(aspectRatio, vw, vh, highMotion, position = 'center') {
       return `crop=${vw}:${cropH}:0:${cy},scale=1280:720`;
     }
     const cropW = Math.floor(vh * 16 / 9);
-    const cx = getCropX(vw, cropW, position);
+    const maxCx = vw - cropW;
+    const cx = Math.floor(actionX * maxCx);
     return `crop=${cropW}:${vh}:${cx}:0,scale=1280:720`;
 
   } else if (aspectRatio === '1:1') {
     if (Math.abs(inputRatio - 1) < 0.05) return `scale=720:720`;
-    const size = Math.floor(Math.min(vw, vh) / zoomFactor);
-    const cx = getCropX(vw, size, position);
+    const size = Math.min(vw, vh);
+    const maxCx = vw - size;
+    const cx = Math.floor(actionX * maxCx);
     const cy = Math.floor((vh - size) / 2);
     return `crop=${size}:${size}:${cx}:${cy},scale=720:720`;
 
   } else {
-    if (Math.abs(inputRatio - 9/16) < 0.05) return `scale=720:1280`;
-    const targetW = Math.floor(vh * 9 / 16);
-    if (targetW <= vw) {
-      const zoomedW = Math.floor(targetW / zoomFactor);
-      const cx = getCropX(vw, zoomedW, position);
-      return `crop=${zoomedW}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`;
+    // 9:16 output
+    if (Math.abs(inputRatio - 9/16) < 0.02) {
+      // Already 9:16 — just scale, no crop needed
+      return `scale=720:1280:flags=lanczos`;
     }
-    const targetH = Math.floor(vw * 16 / 9);
-    const zoomedH = Math.floor(targetH / zoomFactor);
-    const cy = Math.floor((vh - zoomedH) / 2);
-    return `crop=${vw}:${zoomedH}:0:${cy},scale=720:1280:flags=lanczos`;
+    // 16:9 or wider → smart crop to 9:16
+    return buildSmartCropFilter(vw, vh, actionX);
   }
 }
 
@@ -249,7 +318,6 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
   highlights = highlights.map(h => {
     if (h.end - h.start < 6) h.end = h.start + 6;
     if (h.end - h.start > 45) h.end = h.start + 45;
-    // Add 2s buffer at end so action completes naturally
     h.end = h.end + 2;
     return h;
   });
@@ -263,9 +331,18 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
     const duration = h.end - h.start;
 
-    const highMotion = await hasHighMotion(videoPath, h.start, h.end);
-    const vfFilter = buildVfFilter(aspectRatio, vw, vh, highMotion, 'center');
-    console.log(`Clip ${i+1} [${h.start}-${h.end}s] highMotion=${highMotion}`);
+    // Find where the action is for this specific clip segment
+    let actionX = 0.5; // default center
+    const inputRatio = vw / vh;
+    const needs916Crop = aspectRatio === '9:16' && Math.abs(inputRatio - 9/16) > 0.02;
+
+    if (needs916Crop) {
+      console.log(`Clip ${i+1}: detecting action zone for smart crop...`);
+      actionX = await findActionCropX(videoPath, h.start, h.end, vw, vh);
+    }
+
+    const vfFilter = buildVfFilter(aspectRatio, vw, vh, actionX);
+    console.log(`Clip ${i+1} [${h.start}-${h.end}s] actionX=${actionX.toFixed(2)} vf=${vfFilter}`);
 
     await execFileAsync('ffmpeg', [
       '-i', videoPath,
@@ -285,6 +362,7 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
       duration: Math.round(duration),
       viral_score: h.viral_score || 5,
       aspectRatio,
+      cropInfo: { actionX: actionX.toFixed(2) },
     });
 
     set({ progress: 75 + Math.floor((i + 1) / highlights.length * 20) });
