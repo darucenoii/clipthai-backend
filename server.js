@@ -21,6 +21,44 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const jobs = new Map();
 
+// Use GPT-4o Vision to detect where the main action/subject is in frame
+async function detectActionPosition(videoPath, startTime, endTime) {
+  try {
+    const midTime = (startTime + endTime) / 2;
+    const framePath = path.join(TMP_DIR, `frame_${Date.now()}.jpg`);
+
+    await execFileAsync('ffmpeg', [
+      '-ss', String(midTime), '-i', videoPath,
+      '-frames:v', '1', '-q:v', '3', '-y', framePath
+    ], { timeout: 10000 });
+
+    const frameBuffer = await readFile(framePath);
+    const base64Frame = frameBuffer.toString('base64');
+    try { await unlink(framePath); } catch {}
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 20,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Frame}`, detail: 'low' } },
+          { type: 'text', text: 'Where is the main action, ball, or subject in this sports frame? Reply ONLY: LEFT, CENTER, or RIGHT.' }
+        ]
+      }]
+    });
+
+    const answer = response.choices[0].message.content.trim().toUpperCase();
+    console.log(`Vision crop position: ${answer}`);
+    if (answer.includes('LEFT')) return 'left';
+    if (answer.includes('RIGHT')) return 'right';
+    return 'center';
+  } catch (err) {
+    console.log(`Vision failed, center fallback: ${err.message.slice(0, 50)}`);
+    return 'center';
+  }
+}
+
 async function getVideoDimensions(videoPath) {
   try {
     const result = await execFileAsync('ffprobe', [
@@ -64,12 +102,17 @@ async function hasHighMotion(videoPath, startTime, endTime) {
   });
 }
 
-function buildVfFilter(aspectRatio, vw, vh, highMotion) {
+function buildVfFilter(aspectRatio, vw, vh, highMotion, position = 'center') {
   const zoomFactor = highMotion ? 1.3 : 1.1;
   const inputRatio = vw / vh;
 
+  function getCropX(vw, cropW, pos) {
+    if (pos === 'left') return Math.max(0, Math.floor(vw * 0.05));
+    if (pos === 'right') return Math.min(vw - cropW, Math.floor(vw - cropW - vw * 0.05));
+    return Math.floor((vw - cropW) / 2);
+  }
+
   if (aspectRatio === '16:9') {
-    // Already 16:9?
     if (Math.abs(inputRatio - 16/9) < 0.05) return `scale=1280:720`;
     const cropH = Math.floor(vw * 9 / 16);
     if (cropH <= vh) {
@@ -77,29 +120,24 @@ function buildVfFilter(aspectRatio, vw, vh, highMotion) {
       return `crop=${vw}:${cropH}:0:${cy},scale=1280:720`;
     }
     const cropW = Math.floor(vh * 16 / 9);
-    const cx = Math.floor((vw - cropW) / 2);
+    const cx = getCropX(vw, cropW, position);
     return `crop=${cropW}:${vh}:${cx}:0,scale=1280:720`;
 
   } else if (aspectRatio === '1:1') {
-    // Already 1:1?
     if (Math.abs(inputRatio - 1) < 0.05) return `scale=720:720`;
     const size = Math.floor(Math.min(vw, vh) / zoomFactor);
-    const cx = Math.floor((vw - size) / 2);
+    const cx = getCropX(vw, size, position);
     const cy = Math.floor((vh - size) / 2);
     return `crop=${size}:${size}:${cx}:${cy},scale=720:720`;
 
   } else {
-    // 9:16
-    // Already 9:16?
     if (Math.abs(inputRatio - 9/16) < 0.05) return `scale=720:1280`;
-    // Input is wider — crop width to make 9:16, then scale up
     const targetW = Math.floor(vh * 9 / 16);
     if (targetW <= vw) {
       const zoomedW = Math.floor(targetW / zoomFactor);
-      const cx = Math.floor((vw - zoomedW) / 2);
+      const cx = getCropX(vw, zoomedW, position);
       return `crop=${zoomedW}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`;
     }
-    // Input is taller — crop height
     const targetH = Math.floor(vw * 16 / 9);
     const zoomedH = Math.floor(targetH / zoomFactor);
     const cy = Math.floor((vh - zoomedH) / 2);
@@ -226,7 +264,11 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const duration = h.end - h.start;
 
     const highMotion = await hasHighMotion(videoPath, h.start, h.end);
-    const vfFilter = buildVfFilter(aspectRatio, vw, vh, highMotion);
+    // Only use Vision when converting wide (16:9) to vertical (9:16) — most expensive crop
+    const inputRatio = vw / vh;
+    const needsVision = aspectRatio === '9:16' && inputRatio > 1.2;
+    const position = needsVision ? await detectActionPosition(videoPath, h.start, h.end) : 'center';
+    const vfFilter = buildVfFilter(aspectRatio, vw, vh, highMotion, position);
     console.log(`Clip ${i+1} [${h.start}-${h.end}s] highMotion=${highMotion}`);
 
     await execFileAsync('ffmpeg', [
