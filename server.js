@@ -65,34 +65,45 @@ async function hasHighMotion(videoPath, startTime, endTime) {
 }
 
 function buildVfFilter(aspectRatio, vw, vh, highMotion) {
-  // zoom level: crop tighter on high motion (simulate zoom)
   const zoomFactor = highMotion ? 1.3 : 1.1;
-
-  let cropW, cropH, outW, outH;
+  const inputRatio = vw / vh;
 
   if (aspectRatio === '16:9') {
-    outW = 1280; outH = 720;
-    cropW = Math.floor(vw / zoomFactor);
-    cropH = Math.floor(cropW * 9 / 16);
-    if (cropH > vh) { cropH = vh; cropW = Math.floor(cropH * 16 / 9); }
+    // Already 16:9?
+    if (Math.abs(inputRatio - 16/9) < 0.05) return `scale=1280:720`;
+    const cropH = Math.floor(vw * 9 / 16);
+    if (cropH <= vh) {
+      const cy = Math.floor((vh - cropH) / 2);
+      return `crop=${vw}:${cropH}:0:${cy},scale=1280:720`;
+    }
+    const cropW = Math.floor(vh * 16 / 9);
+    const cx = Math.floor((vw - cropW) / 2);
+    return `crop=${cropW}:${vh}:${cx}:0,scale=1280:720`;
+
   } else if (aspectRatio === '1:1') {
-    outW = 720; outH = 720;
-    const base = Math.min(vw, vh);
-    cropW = Math.floor(base / zoomFactor);
-    cropH = cropW;
+    // Already 1:1?
+    if (Math.abs(inputRatio - 1) < 0.05) return `scale=720:720`;
+    const size = Math.floor(Math.min(vw, vh) / zoomFactor);
+    const cx = Math.floor((vw - size) / 2);
+    const cy = Math.floor((vh - size) / 2);
+    return `crop=${size}:${size}:${cx}:${cy},scale=720:720`;
+
   } else {
     // 9:16
-    outW = 720; outH = 1280;
-    cropH = Math.floor(vh / zoomFactor);
-    cropW = Math.floor(cropH * 9 / 16);
-    if (cropW > vw) { cropW = vw; cropH = Math.floor(cropW * 16 / 9); }
+    // Already 9:16?
+    if (Math.abs(inputRatio - 9/16) < 0.05) return `scale=720:1280`;
+    // Input is wider than 9:16 (e.g. 16:9) — crop width
+    const targetW = Math.floor(vh * 9 / 16);
+    if (targetW <= vw) {
+      const cropW = Math.floor(targetW / zoomFactor);
+      const cx = Math.floor((vw - cropW) / 2);
+      return `crop=${cropW}:${vh}:${cx}:0,scale=720:1280`;
+    }
+    // Input is taller than 9:16 — crop height
+    const cropH = Math.floor(vw * 16 / 9 / zoomFactor);
+    const cy = Math.floor((vh - cropH) / 2);
+    return `crop=${vw}:${cropH}:0:${cy},scale=720:1280`;
   }
-
-  // center crop
-  const cx = Math.max(Math.floor((vw - cropW) / 2), 0);
-  const cy = Math.max(Math.floor((vh - cropH) / 2), 0);
-
-  return `crop=${cropW}:${cropH}:${cx}:${cy},scale=${outW}:${outH}`;
 }
 
 const app = express();
