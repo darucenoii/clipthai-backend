@@ -21,7 +21,6 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const jobs = new Map();
 
-// Get video dimensions
 async function getVideoDimensions(videoPath) {
   try {
     const result = await execFileAsync('ffprobe', [
@@ -35,90 +34,71 @@ async function getVideoDimensions(videoPath) {
     const h = parseInt(parts[1]) || 360;
     const fpsStr = parts[2] || '30/1';
     const fpsParts = fpsStr.split('/');
-    const fps = Math.round(parseInt(fpsParts[0]) / (parseInt(fpsParts[1]) || 1));
-    return { width: w, height: h, fps: fps || 30 };
+    const fps = Math.round(parseInt(fpsParts[0]) / (parseInt(fpsParts[1]) || 1)) || 30;
+    return { width: w, height: h, fps };
   } catch {
     return { width: 640, height: 360, fps: 30 };
   }
 }
 
-// Analyze motion per-frame in clip range, return list of high-motion timestamps
-async function getMotionTimestamps(videoPath, startTime, endTime) {
+// Check if clip has high motion (bool)
+async function hasHighMotion(videoPath, startTime, endTime) {
   return new Promise((resolve) => {
-    const duration = Math.min(endTime - startTime, 60);
-    const motionFrames = [];
-
+    const duration = Math.min(endTime - startTime, 8);
     const proc = spawn('ffmpeg', [
-      '-ss', String(startTime),
-      '-t', String(duration),
+      '-ss', String(startTime), '-t', String(duration),
       '-i', videoPath,
       '-vf', 'mestimate=method=epzs:mb_size=16,metadata=print:file=-',
       '-an', '-f', 'null', '/dev/null'
     ]);
-
     let stderr = '';
     proc.stderr.on('data', d => stderr += d.toString());
     proc.on('close', () => {
-      try {
-        // Find frames with high motion magnitude
-        const frameBlocks = stderr.split('frame:');
-        frameBlocks.forEach((block, idx) => {
-          const mvMatches = [...block.matchAll(/MV_[xy]=([+-]?\d+\.?\d*)/g)];
-          if (mvMatches.length === 0) return;
-          const magnitude = mvMatches.reduce((sum, m) => sum + Math.abs(parseFloat(m[1])), 0) / mvMatches.length;
-          if (magnitude > 3) { // high motion threshold
-            motionFrames.push({ frameIdx: idx, magnitude });
-          }
-        });
-        resolve(motionFrames);
-      } catch {
-        resolve([]);
-      }
+      const matches = [...stderr.matchAll(/MV_[xy]=([+-]?\d+\.?\d*)/g)];
+      if (matches.length === 0) return resolve(false);
+      const avg = matches.reduce((s, m) => s + Math.abs(parseFloat(m[1])), 0) / matches.length;
+      resolve(avg > 4);
     });
-    proc.on('error', () => resolve([]));
-    setTimeout(() => resolve(motionFrames), 15000);
+    proc.on('error', () => resolve(false));
+    setTimeout(() => resolve(false), 12000);
   });
 }
 
-// Build dynamic zoompan filter based on motion analysis
-async function buildDynamicZoomFilter(videoPath, startTime, endTime, aspectRatio, vw, vh, fps) {
-  const duration = endTime - startTime;
-  const totalFrames = Math.floor(duration * fps);
+function buildVfFilter(aspectRatio, vw, vh, fps, duration, highMotion) {
+  const totalFrames = Math.max(Math.floor(duration * fps), 1);
 
-  // Get motion timestamps for this clip
-  const motionFrames = await getMotionTimestamps(videoPath, startTime, endTime);
+  // Simple zoom: slow gentle zoom in (works on all ffmpeg versions)
+  // highMotion = faster zoom, lowMotion = slower zoom
+  const zoomSpeed = highMotion ? '0.0015' : '0.0008';
+  const maxZoom = highMotion ? '1.4' : '1.2';
 
-  // Build zoom expression: zoom in on high-motion frames, zoom out on calm frames
-  // zoompan: z=zoom, x=pan_x, y=pan_y, d=duration_frames
-  let zoomExpr, xExpr, yExpr;
-
-  if (motionFrames.length > 3) {
-    // Dynamic zoom: zoom in to 1.5x on high motion, return to 1x on calm
-    zoomExpr = `if(gt(on\\,1)\\,if(gt(mod(on\\,${fps})\\,${Math.floor(fps*0.3)})\\,min(zoom+0.002\\,1.5)\\,max(zoom-0.004\\,1))\\,1)`;
-    xExpr = `iw/2-(iw/zoom/2)`;
-    yExpr = `ih/2-(ih/zoom/2)`;
-  } else {
-    // Gentle zoom in throughout clip (for calm footage)
-    zoomExpr = `min(zoom+0.0008\\,1.3)`;
-    xExpr = `iw/2-(iw/zoom/2)`;
-    yExpr = `ih/2-(ih/zoom/2)`;
-  }
-
-  const zoompan = `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=${totalFrames}:s=${vw}x${vh}:fps=${fps}`;
+  let cropW, cropH, outW, outH;
 
   if (aspectRatio === '16:9') {
-    return `${zoompan},scale=1280:720`;
+    cropW = vw; cropH = Math.floor(vw * 9 / 16);
+    if (cropH > vh) { cropH = vh; cropW = Math.floor(vh * 16 / 9); }
+    outW = 1280; outH = 720;
   } else if (aspectRatio === '1:1') {
-    const size = Math.min(vw, vh);
-    const cx = Math.floor((vw - size) / 2);
-    const cy = Math.floor((vh - size) / 2);
-    return `crop=${size}:${size}:${cx}:${cy},${zoompan.replace(`s=${vw}x${vh}`, `s=${size}x${size}`)},scale=720:720`;
+    const s = Math.min(vw, vh);
+    cropW = s; cropH = s;
+    outW = 720; outH = 720;
   } else {
     // 9:16
-    const targetW = Math.floor(vh * 9 / 16);
-    const cropX = Math.floor((vw - targetW) / 2);
-    return `crop=${targetW}:${vh}:${cropX}:0,${zoompan.replace(`s=${vw}x${vh}`, `s=${targetW}x${vh}`)},scale=720:1280`;
+    cropW = Math.floor(vh * 9 / 16);
+    if (cropW > vw) cropW = vw;
+    cropH = vh;
+    outW = 720; outH = 1280;
   }
+
+  const cx = Math.floor((vw - cropW) / 2);
+  const cy = Math.floor((vh - cropH) / 2);
+
+  // crop to aspect ratio first, then apply smooth zoom
+  const cropFilter = `crop=${cropW}:${cropH}:${cx}:${cy}`;
+  const zoomFilter = `zoompan=z='min(zoom+${zoomSpeed},${maxZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${cropW}x${cropH}:fps=${fps}`;
+  const scaleFilter = `scale=${outW}:${outH}`;
+
+  return `${cropFilter},${zoomFilter},${scaleFilter}`;
 }
 
 const app = express();
@@ -176,7 +156,6 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
   const audioPath = path.join(TMP_DIR, `${jobId}.mp3`);
   const isYoutube = /youtube\.com|youtu\.be/.test(inputUrl);
 
-  // Step 1: Download
   set({ progress: 10, step: 'downloading' });
   if (isYoutube) {
     await ytdlpDownload(inputUrl, videoPath);
@@ -187,24 +166,20 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
   const { width: vw, height: vh, fps } = await getVideoDimensions(videoPath);
   console.log(`Video: ${vw}x${vh} @ ${fps}fps`);
 
-  // Step 2: Extract audio
   set({ progress: 30, step: 'extracting_audio' });
   await execFileAsync('ffmpeg', [
     '-i', videoPath, '-vn', '-ar', '16000', '-ac', '1', '-b:a', '64k', '-y', audioPath
   ], { timeout: 60000 });
 
-  // Step 3: Whisper transcribe
   set({ progress: 50, step: 'transcribing' });
   const audioBuffer = await readFile(audioPath);
   const audioFile = new File([audioBuffer], 'audio.mp3', { type: 'audio/mpeg' });
   const transcription = await openai.audio.transcriptions.create({
-    file: audioFile,
-    model: 'whisper-1',
+    file: audioFile, model: 'whisper-1',
     response_format: 'verbose_json',
     timestamp_granularities: ['segment'],
   });
 
-  // Step 4: GPT-4o-mini analyze
   set({ progress: 65, step: 'analyzing' });
   const segments = transcription.segments || [];
   const segText = segments.map(s => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}s] ${s.text}`).join('\n');
@@ -213,14 +188,7 @@ async function processMode1(jobId, inputUrl, aspectRatio) {
     model: 'gpt-4o-mini',
     response_format: { type: 'json_object' },
     messages: [
-      {
-        role: 'system',
-        content: `You are a viral video editor. Pick 3-5 best highlight clips.
-RULES:
-- Each clip minimum 6 seconds (end - start >= 6)
-- Each clip maximum 45 seconds (end - start <= 45)
-Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}`
-      },
+      { role: 'system', content: `Pick 3-5 viral highlight clips. Min 6s, max 45s each. Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}` },
       { role: 'user', content: `Find highlights:\n${segText}` }
     ],
     max_tokens: 1000,
@@ -233,7 +201,6 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     return h;
   });
 
-  // Step 5: Cut + dynamic zoom each clip
   set({ progress: 75, step: 'cutting_clips' });
   const clips = [];
 
@@ -241,30 +208,29 @@ Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","v
     const h = highlights[i];
     const clipId = `${jobId}_clip${i + 1}`;
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
+    const duration = h.end - h.start;
 
-    console.log(`Building dynamic zoom for clip ${i+1} [${h.start}-${h.end}s]...`);
-    const vfFilter = await buildDynamicZoomFilter(videoPath, h.start, h.end, aspectRatio, vw, vh, fps);
-    console.log(`Clip ${i+1} filter: ${vfFilter.slice(0, 80)}...`);
+    // Check motion level for this clip
+    const highMotion = await hasHighMotion(videoPath, h.start, h.end);
+    const vfFilter = buildVfFilter(aspectRatio, vw, vh, fps, duration, highMotion);
+    console.log(`Clip ${i+1} [${h.start}-${h.end}s] highMotion=${highMotion}`);
 
     await execFileAsync('ffmpeg', [
       '-i', videoPath,
-      '-ss', String(h.start),
-      '-to', String(h.end),
+      '-ss', String(h.start), '-to', String(h.end),
       '-vf', vfFilter,
-      '-c:v', 'libx264',
-      '-c:a', 'aac',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-c:v', 'libx264', '-c:a', 'aac',
+      '-preset', 'fast', '-crf', '23',
       '-movflags', '+faststart',
       '-y', clipPath
-    ], { timeout: 180000 }); // longer timeout for zoompan
+    ], { timeout: 180000 });
 
     clips.push({
       url: `${PUBLIC_BASE_URL}/outputs/${clipId}.mp4`,
       title: h.title || `Clip ${i + 1}`,
       keyword: h.keyword || '',
       start: h.start, end: h.end,
-      duration: Math.round(h.end - h.start),
+      duration: Math.round(duration),
       viral_score: h.viral_score || 5,
       aspectRatio,
     });
