@@ -211,19 +211,26 @@ app.post('/mode1', async (req, res) => {
 });
 
 async function ytdlpDownload(url, outputPath) {
+  // Auto-update yt-dlp to handle YouTube API changes
+  try { await execFileAsync('yt-dlp', ['-U'], { timeout: 30000 }); console.log('yt-dlp updated'); }
+  catch { console.log('yt-dlp update skipped'); }
+
+  const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath];
   const strategies = [
-    // Strategy 1: best 1080p with android client
+    // Strategy 1: android + 1080p
     ['--extractor-args', 'youtube:player_client=android',
-     '--format', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best[ext=mp4][height<=720]/best',
-     '--merge-output-format', 'mp4',
-     '--no-playlist', '--no-check-certificate', '--output', outputPath, url],
-    // Strategy 2: ios client fallback
+     '--format', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+     '--merge-output-format', 'mp4', ...base, url],
+    // Strategy 2: ios client
     ['--extractor-args', 'youtube:player_client=ios',
      '--format', 'best[ext=mp4][height<=1080]/best[ext=mp4][height<=720]/best',
-     '--no-playlist', '--no-check-certificate', '--output', outputPath, url],
-    // Strategy 3: any quality
-    ['--format', 'best[height<=1080]/best[height<=720]/best',
-     '--no-playlist', '--no-check-certificate', '--output', outputPath, url],
+     ...base, url],
+    // Strategy 3: tv_embedded (bypasses some restrictions)
+    ['--extractor-args', 'youtube:player_client=tv_embedded',
+     '--format', 'best[height<=1080]/best[height<=720]/best',
+     ...base, url],
+    // Strategy 4: web last resort
+    ['--format', 'best[height<=720]/best', ...base, url],
   ];
   let lastError;
   for (const args of strategies) {
