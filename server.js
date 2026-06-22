@@ -243,15 +243,20 @@ async function ytdlpDownload(url, outputPath) {
   catch { console.log('yt-dlp update skipped'); }
 
   // Write cookies file from env variable if available
+  // Write cookies file from env variable
   let cookiesArg = [];
-  if (process.env.YOUTUBE_COOKIES_BASE64) {
+  const cookiesB64 = process.env.YOUTUBE_COOKIES_BASE64;
+  if (cookiesB64 && cookiesB64.length > 100) {
     try {
-      const cookiesPath = path.join(TMP_DIR, 'yt_cookies.txt');
-      const cookiesContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf8');
-      await writeFile(cookiesPath, cookiesContent);
+      const cookiesPath = '/tmp/yt_cookies.txt';  // fixed absolute path
+      const cookiesContent = Buffer.from(cookiesB64.trim(), 'base64').toString('utf8');
+      const { writeFileSync } = await import('fs');
+      writeFileSync(cookiesPath, cookiesContent, 'utf8');
       cookiesArg = ['--cookies', cookiesPath];
-      console.log('Using YouTube cookies');
+      console.log('Using YouTube cookies, size:', cookiesContent.length);
     } catch(e) { console.log('Cookies setup failed:', e.message); }
+  } else {
+    console.log('No cookies env var found');
   }
 
   const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath, ...cookiesArg];
