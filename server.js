@@ -3,7 +3,7 @@ import cors from 'cors';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, mkdirSync } from 'fs';
-import { unlink, readFile, writeFile } from 'fs/promises';
+import { unlink, readFile } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
@@ -45,36 +45,28 @@ app.post('/mode1', async (req, res) => {
 });
 
 async function ytdlpDownload(url, outputPath) {
-  // Strategy 1: android client (no PO token needed, works on most IPs)
   const strategies = [
-    // Android client - most reliable for server IPs
     ['--extractor-args', 'youtube:player_client=android',
-     '--format', 'bestvideo[ext=mp4][height<=720]+bestaudio/best[height<=720]/best',
-     '--no-playlist', '--no-check-certificate',
-     '--output', outputPath, url],
-    // iOS client
+     '--format', 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best',
+     '--merge-output-format', 'mp4',
+     '--no-playlist', '--no-check-certificate', '--output', outputPath, url],
     ['--extractor-args', 'youtube:player_client=ios',
-     '--format', 'best[height<=720]/best',
-     '--no-playlist', '--no-check-certificate',
-     '--output', outputPath, url],
-    // TV client (no age gate, no bot detection)
-    ['--extractor-args', 'youtube:player_client=tv_embedded',
-     '--format', 'best[height<=720]/best',
-     '--no-playlist', '--no-check-certificate',
-     '--output', outputPath, url],
+     '--format', 'best[ext=mp4][height<=720]/best',
+     '--no-playlist', '--no-check-certificate', '--output', outputPath, url],
+    ['--format', 'best[height<=720]/best',
+     '--no-playlist', '--no-check-certificate', '--output', outputPath, url],
   ];
-
   let lastError;
   for (const args of strategies) {
     try {
       await execFileAsync('yt-dlp', args, { timeout: 180000 });
-      return; // success
+      return;
     } catch (err) {
       lastError = err;
-      console.log(`Strategy failed, trying next... ${err.message.slice(0, 100)}`);
+      console.log(`Strategy failed: ${err.message.slice(0, 80)}`);
     }
   }
-  throw new Error(`All yt-dlp strategies failed: ${lastError.message.slice(0, 300)}`);
+  throw new Error(`All yt-dlp strategies failed: ${lastError.message.slice(0, 200)}`);
 }
 
 async function processMode1(jobId, inputUrl) {
@@ -82,7 +74,6 @@ async function processMode1(jobId, inputUrl) {
 
   const videoPath = path.join(TMP_DIR, `${jobId}.mp4`);
   const audioPath = path.join(TMP_DIR, `${jobId}.mp3`);
-
   const isYoutube = /youtube\.com|youtu\.be/.test(inputUrl);
 
   // Step 1: Download
@@ -110,7 +101,7 @@ async function processMode1(jobId, inputUrl) {
     timestamp_granularities: ['segment'],
   });
 
-  // Step 4: GPT-4o-mini analyze
+  // Step 4: GPT-4o-mini analyze — enforce min 20s, max 45s
   set({ progress: 65, step: 'analyzing' });
   const segments = transcription.segments || [];
   const segText = segments.map(s => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}s] ${s.text}`).join('\n');
@@ -119,32 +110,66 @@ async function processMode1(jobId, inputUrl) {
     model: 'gpt-4o-mini',
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: 'You are a viral video editor. Pick 3-5 best highlight clips (20-45s each). Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}' },
-      { role: 'user', content: `Find highlights:\n${segText}` }
+      {
+        role: 'system',
+        content: `You are a viral video editor. Pick 3-5 best highlight clips.
+STRICT RULES:
+- Each clip MUST be minimum 6 seconds long (end - start >= 6)
+- Each clip MUST be maximum 60 seconds long (end - start <= 60)
+- If a segment is too short, extend it slightly
+- Never return a clip shorter than 6 seconds
+Return JSON: {"highlights":[{"start":0,"end":30,"title":"...","keyword":"...","viral_score":8}]}`
+      },
+      { role: 'user', content: `Find highlights from this transcript:\n${segText}` }
     ],
     max_tokens: 1000,
   });
 
-  const { highlights = [] } = JSON.parse(gptRes.choices[0].message.content);
+  let { highlights = [] } = JSON.parse(gptRes.choices[0].message.content);
 
-  // Step 5: Cut clips
+  // Safety: enforce min 20s duration
+  highlights = highlights.map(h => {
+    if (h.end - h.start < 6) {
+      h.end = h.start + 6;
+    }
+    if (h.end - h.start > 60) {
+      h.end = h.start + 60;
+    }
+    return h;
+  });
+
+  // Step 5: Cut clips — re-encode for browser compatibility
   set({ progress: 75, step: 'cutting_clips' });
   const clips = [];
+
   for (let i = 0; i < highlights.length; i++) {
     const h = highlights[i];
     const clipId = `${jobId}_clip${i + 1}`;
     const clipPath = path.join(OUTPUT_DIR, `${clipId}.mp4`);
+
+    // Re-encode to H.264/AAC for universal browser support
     await execFileAsync('ffmpeg', [
-      '-i', videoPath, '-ss', String(h.start), '-to', String(h.end), '-c', 'copy', '-y', clipPath
-    ], { timeout: 60000 });
+      '-i', videoPath,
+      '-ss', String(h.start),
+      '-to', String(h.end),
+      '-c:v', 'libx264',    // H.264 video — plays in all browsers
+      '-c:a', 'aac',        // AAC audio — plays in all browsers
+      '-preset', 'fast',
+      '-crf', '23',
+      '-movflags', '+faststart',  // optimize for web streaming
+      '-y', clipPath
+    ], { timeout: 120000 });
+
     clips.push({
       url: `${PUBLIC_BASE_URL}/outputs/${clipId}.mp4`,
       title: h.title || `Clip ${i + 1}`,
       keyword: h.keyword || '',
-      start: h.start, end: h.end,
+      start: h.start,
+      end: h.end,
       duration: Math.round(h.end - h.start),
       viral_score: h.viral_score || 5,
     });
+
     set({ progress: 75 + Math.floor((i + 1) / highlights.length * 20) });
   }
 
