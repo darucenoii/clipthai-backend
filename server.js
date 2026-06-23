@@ -262,14 +262,30 @@ async function ytdlpDownload(url, outputPath) {
 
   // Write cookies file from env variable if available
   let cookiesArg = [];
-  if (process.env.YOUTUBE_COOKIES_BASE64) {
+  const _cookiesB64 = process.env.YOUTUBE_COOKIES_BASE64;
+  if (_cookiesB64 && _cookiesB64.length > 100) {
     try {
       const cookiesPath = '/tmp/yt_cookies.txt';
-      const cookiesContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64.trim(), 'base64').toString('utf8');
-      await writeFile(cookiesPath, cookiesContent, 'utf8');
-      cookiesArg = ['--cookies', cookiesPath];
-      console.log('Using YouTube cookies, size:', cookiesContent.length);
-    } catch(e) { console.log('Cookies setup failed:', e.message); }
+      const cookiesContent = Buffer.from(_cookiesB64.trim(), 'base64').toString('utf8');
+      if (cookiesContent.length < 100) throw new Error('Decoded cookies too short');
+      // Use sync write to ensure file exists before yt-dlp runs
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(cookiesPath, cookiesContent, 'utf8');
+      // Verify file was written
+      const { statSync } = await import('node:fs');
+      const stat = statSync(cookiesPath);
+      if (stat.size > 0) {
+        cookiesArg = ['--cookies', cookiesPath];
+        console.log('Cookies ready:', cookiesPath, stat.size, 'bytes');
+      } else {
+        throw new Error('Cookies file empty after write');
+      }
+    } catch(e) {
+      console.log('Cookies setup failed:', e.message);
+      cookiesArg = []; // ensure no broken path
+    }
+  } else {
+    console.log('YOUTUBE_COOKIES_BASE64 not set or too short, skipping cookies');
   }
 
   const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath, ...cookiesArg];
