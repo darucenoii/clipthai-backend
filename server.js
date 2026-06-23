@@ -36,25 +36,19 @@ async function getVideoDimensions(videoPath) {
   } catch { return { width: 1280, height: 720, fps: 30 }; }
 }
 
-// ─── Motion-based crop: find action column X, fixed Y bias ─────────────────────
-// Strategy:
-//   1. Sample frames at 5fps, diff consecutive frames → per-column motion sum
-//   2. Smooth cx over time (window=15) to avoid jitter
-//   3. Y: fixed bias — always crop from y=10% to y=72% (removes scoreboard + empty grass)
-//   4. Zoom: 1.3x for 9:16 portrait, 1.5x for 1:1 square
-
-async function analyzeMotionCx(videoPath, startTime, endTime, vw, vh) {
+// ─── Player detection: find centroid of non-grass pixels (players, ball, goal) ─
+// Returns [{t, cx_norm, cy_norm}] sampled every 0.25s
+async function detectPlayerCentroids(videoPath, startTime, endTime, vw, vh) {
   return new Promise((resolve) => {
     const duration = Math.min(endTime - startTime, 45);
-    const y1 = Math.round(vh * 0.10);
-    const y2 = Math.round(vh * 0.72);
-    const roiH = y2 - y1;
+    // Scale down for speed, keep aspect ratio
+    const scaleW = 160, scaleH = Math.round(160 * vh / vw);
 
     const proc = spawn('ffmpeg', [
       '-ss', String(startTime), '-t', String(duration),
       '-i', videoPath,
-      '-vf', `crop=${vw}:${roiH}:0:${y1},scale=160:${Math.round(160*roiH/vw)}`,
-      '-f', 'rawvideo', '-pix_fmt', 'gray', '-r', '5', 'pipe:1'
+      '-vf', `scale=${scaleW}:${scaleH}`,
+      '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-r', '4', 'pipe:1'
     ]);
 
     const chunks = [];
@@ -65,105 +59,154 @@ async function analyzeMotionCx(videoPath, startTime, endTime, vw, vh) {
 
     proc.on('close', () => {
       try {
-        const fw = 160;
-        const fh = Math.round(160 * roiH / vw);
-        const fsize = fw * fh;
+        const fw = scaleW, fh = scaleH;
+        const fsize = fw * fh * 3; // RGB
         const raw = Buffer.concat(chunks);
         const nFrames = Math.floor(raw.length / fsize);
-        if (nFrames < 2) return resolve([]);
+        if (nFrames < 1) return resolve([]);
 
         const results = [];
-        for (let i = 1; i < nFrames; i++) {
-          const prev = raw.slice((i-1)*fsize, i*fsize);
-          const curr = raw.slice(i*fsize, (i+1)*fsize);
-          const cols = new Float32Array(fw);
-          let total = 0;
-          for (let y = 0; y < fh; y++) {
+        // Skip scoreboard: top 10% of frame
+        const skipTop = Math.floor(fh * 0.10);
+
+        for (let i = 0; i < nFrames; i++) {
+          const base = i * fsize;
+          let sumX = 0, sumY = 0, count = 0;
+
+          for (let y = skipTop; y < fh; y++) {
             for (let x = 0; x < fw; x++) {
-              const d = Math.abs(curr[y*fw+x] - prev[y*fw+x]);
-              cols[x] += d;
-              total += d;
+              const idx = base + (y * fw + x) * 3;
+              const R = raw[idx], G = raw[idx+1], B = raw[idx+2];
+
+              // Detect grass: high green, low red/blue relative to green
+              // Grass hue ~100-140 deg in HSV, roughly G >> R and G >> B
+              const isGrass = G > 80 && G > R * 1.3 && G > B * 1.15 && G < 210;
+
+              if (!isGrass) {
+                sumX += x;
+                sumY += y;
+                count++;
+              }
             }
           }
-          const cx_norm = total > 300
-            ? cols.reduce((s,v,x) => s + v*x, 0) / (total * fw)
-            : 0.5;
-          results.push({ t: startTime + i/5, cx_norm });
+
+          const cx_norm = count > 50 ? sumX / count / fw : 0.5;
+          const cy_norm = count > 50 ? sumY / count / fh : 0.4;
+          results.push({ t: startTime + i / 4, cx_norm, cy_norm });
         }
+
         resolve(results);
-      } catch(e) { resolve([]); }
+      } catch(e) {
+        console.log('detectPlayerCentroids error:', e.message);
+        resolve([]);
+      }
     });
   });
 }
 
-function smooth(arr, w = 15) {
+function smooth(arr, w = 12) {
   return arr.map((_, i) => {
     const s = arr.slice(Math.max(0, i-w), i+w+1);
-    return s.reduce((a,b) => a+b, 0) / s.length;
+    return s.reduce((a, b) => a + b, 0) / s.length;
   });
 }
 
-// ─── Smart crop: motion X pan + fixed Y bias + zoom ──────────────────────────
+// ─── Smart crop: zoom + pan XY following players ──────────────────────────────
 async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio, clipId) {
   const inputRatio = vw / vh;
 
-  // 16:9 output: simple letterbox crop
+  // Non 9:16 outputs: simple crop
   if (aspectRatio === '16:9') {
     if (Math.abs(inputRatio - 16/9) < 0.05) return { vf: 'scale=1280:720', scFile: null };
     const cropH = Math.floor(vw * 9/16);
     const cy = Math.floor((vh - cropH) / 2);
     return { vf: `crop=${vw}:${cropH}:0:${cy},scale=1280:720`, scFile: null };
   }
+  if (aspectRatio === '1:1') {
+    const s = Math.min(vw, vh);
+    return { vf: `crop=${s}:${s}:${Math.floor((vw-s)/2)}:0,scale=720:720`, scFile: null };
+  }
 
-  // Output dimensions
-  const outW = 720;
-  const outH = aspectRatio === '9:16' ? 1280 : 720;
+  // ── 9:16 output ──────────────────────────────────────────────────────────────
+  // Two cases:
+  // A) Input is 16:9 (e.g. 1920x1080, 1280x720, 640x360) → crop 9:16 window + zoom
+  // B) Input is already 9:16 (e.g. 720x1280) → zoom + pan XY only
 
-  // Fixed Y: always crop action zone — skip scoreboard top 10%, skip empty grass bottom 28%
-  const y1    = Math.round(vh * 0.10);
-  const y2    = Math.round(vh * 0.72);
-  const cropH = y2 - y1;  // 62% of frame height
+  const is169  = inputRatio > 1.5;    // 16:9 or wider
+  const is916  = Math.abs(inputRatio - 9/16) < 0.05;
 
-  // Zoom: 1.3x for portrait 9:16, 1.5x for square 1:1
-  const ZOOM = aspectRatio === '9:16' ? 1.3 : 1.5;
+  console.log(`  Input: ${vw}x${vh} ratio=${inputRatio.toFixed(2)} is169=${is169} is916=${is916}`);
 
-  // Crop width: for 9:16 output use 9:16 ratio of cropH, for 1:1 use cropH
-  const baseCropW = aspectRatio === '9:16'
-    ? Math.floor(cropH * 9 / 16)
-    : cropH;
-  const cropW = Math.max(60, Math.floor(baseCropW / ZOOM));
-  const maxCx = vw - cropW;
+  // Detect where players actually are
+  const raw = await detectPlayerCentroids(videoPath, startTime, endTime, vw, vh);
 
-  console.log(`  Crop: ${vw}x${vh} → ${cropW}x${cropH} at y=${y1} zoom=${ZOOM}x → ${outW}x${outH}`);
-
-  // Analyze motion to find action column X
-  const raw = await analyzeMotionCx(videoPath, startTime, endTime, vw, vh);
-
-  // Fallback: center crop
   if (raw.length < 3) {
-    const cx = Math.floor(maxCx / 2);
-    return { vf: `crop=${cropW}:${cropH}:${cx}:${y1},scale=${outW}:${outH}:flags=lanczos`, scFile: null };
+    // Fallback: static crop
+    if (is169) {
+      const cw = Math.floor(vh * 9/16);
+      const cx = Math.floor((vw - cw) / 2);
+      return { vf: `crop=${cw}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`, scFile: null };
+    }
+    return { vf: 'scale=720:1280:flags=lanczos', scFile: null };
   }
 
   const cx_s = smooth(raw.map(r => r.cx_norm), 15);
+  const cy_s = smooth(raw.map(r => r.cy_norm), 15);
   const avgCx = cx_s.reduce((a,b)=>a+b,0)/cx_s.length;
-  console.log(`  Motion cx avg=${avgCx.toFixed(2)} samples=${raw.length}`);
+  const avgCy = cy_s.reduce((a,b)=>a+b,0)/cy_s.length;
+  console.log(`  Player centroid: cx=${avgCx.toFixed(2)} cy=${avgCy.toFixed(2)}`);
 
-  // Build sendcmd for smooth X pan
-  const lines = [];
-  for (let i = 0; i < raw.length; i++) {
-    const cx = Math.max(0, Math.min(maxCx, Math.floor(cx_s[i]*vw - cropW/2)));
-    const rel = Math.max(0, raw[i].t - startTime);
-    lines.push(`${rel.toFixed(3)} crop x ${cx};`);
+  // Zoom 1.5x — enough to remove empty space, not too tight
+  const ZOOM = 1.5;
+
+  let outW, outH, cropW, cropH, lines, cw0, ch0, cx0, cy0;
+
+  if (is169) {
+    // 16:9 → 9:16: first pick 9:16 window, then zoom
+    const base9_16W = Math.floor(vh * 9 / 16);
+    cropW = Math.floor(base9_16W / ZOOM);
+    cropH = Math.floor(vh / ZOOM);
+    outW = 720; outH = 1280;
+
+    lines = [];
+    for (let i = 0; i < raw.length; i++) {
+      const maxX = vw - cropW, maxY = vh - cropH;
+      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
+      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
+      const rel = Math.max(0, raw[i].t - startTime);
+      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
+      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
+    }
+    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
+    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
+    cw0 = cropW; ch0 = cropH;
+
+  } else {
+    // Already 9:16: zoom + pan XY
+    cropW = Math.floor(vw / ZOOM);
+    cropH = Math.floor(vh / ZOOM);
+    outW = vw; outH = vh;
+
+    lines = [];
+    for (let i = 0; i < raw.length; i++) {
+      const maxX = vw - cropW, maxY = vh - cropH;
+      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
+      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
+      const rel = Math.max(0, raw[i].t - startTime);
+      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
+      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
+    }
+    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
+    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
+    cw0 = cropW; ch0 = cropH;
   }
 
-  const cx0 = Math.max(0, Math.min(maxCx, Math.floor(cx_s[0]*vw - cropW/2)));
   const scPath = path.join(TMP_DIR, `${clipId}_sc.txt`);
   await writeFile(scPath, lines.join('\n'));
 
   const vf = [
     `sendcmd=f='${scPath}'`,
-    `crop=${cropW}:${cropH}:${cx0}:${y1}`,
+    `crop=${cw0}:${ch0}:${cx0}:${cy0}`,
     `scale=${outW}:${outH}:flags=lanczos`
   ].join(',');
 
@@ -200,19 +243,15 @@ async function ytdlpDownload(url, outputPath) {
   catch { console.log('yt-dlp update skipped'); }
 
   // Write cookies file from env variable if available
-  // Write cookies file from env variable
   let cookiesArg = [];
-  const cookiesB64 = process.env.YOUTUBE_COOKIES_BASE64;
-  if (cookiesB64 && cookiesB64.length > 100) {
+  if (process.env.YOUTUBE_COOKIES_BASE64) {
     try {
       const cookiesPath = '/tmp/yt_cookies.txt';
-      const cookiesContent = Buffer.from(cookiesB64.trim(), 'base64').toString('utf8');
+      const cookiesContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64.trim(), 'base64').toString('utf8');
       await writeFile(cookiesPath, cookiesContent, 'utf8');
       cookiesArg = ['--cookies', cookiesPath];
       console.log('Using YouTube cookies, size:', cookiesContent.length);
     } catch(e) { console.log('Cookies setup failed:', e.message); }
-  } else {
-    console.log('No cookies env var, skipping');
   }
 
   const base = ['--no-playlist', '--no-check-certificate', '--socket-timeout', '30', '--retries', '3', '--output', outputPath, ...cookiesArg];
