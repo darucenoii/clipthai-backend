@@ -133,9 +133,9 @@ async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio
   // Detect where players actually are
   const raw = await detectPlayerCentroids(videoPath, startTime, endTime, vw, vh);
 
-  // Output dimensions
-  const outW = aspectRatio === '9:16' ? 720 : 720;
-  const outH = aspectRatio === '9:16' ? 1280 : 720;
+  // Output dimensions based on aspectRatio
+  const outW = aspectRatio === '16:9' ? 1280 : 720;
+  const outH = aspectRatio === '9:16' ? 1280 : 720;  // 1:1 → 720x720, 9:16 → 720x1280
 
   if (raw.length < 3) {
     // Fallback: static center crop with zoom
