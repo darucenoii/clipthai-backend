@@ -111,106 +111,124 @@ function smooth(arr, w = 12) {
   });
 }
 
-// ─── Smart crop: zoom + pan XY following players ──────────────────────────────
+// ─── Smart crop: motion-based dynamic zoom + pan ────────────────────────────
 async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio, clipId) {
   const inputRatio = vw / vh;
 
-  // Non 9:16 outputs: simple crop
   if (aspectRatio === '16:9') {
     if (Math.abs(inputRatio - 16/9) < 0.05) return { vf: 'scale=1280:720', scFile: null };
     const cropH = Math.floor(vw * 9/16);
-    const cy = Math.floor((vh - cropH) / 2);
+    const cy    = Math.floor((vh - cropH) / 2);
     return { vf: `crop=${vw}:${cropH}:0:${cy},scale=1280:720`, scFile: null };
   }
-  if (aspectRatio === '1:1') {
-    const s = Math.min(vw, vh);
-    return { vf: `crop=${s}:${s}:${Math.floor((vw-s)/2)}:0,scale=720:720`, scFile: null };
+
+  const outW = 720;
+  const outH = aspectRatio === '9:16' ? 1280 : 720;
+
+  // For 16:9 input: pre-crop to 9:16 center slice first
+  let srcW = vw, srcH = vh, preCrop = '';
+  if (inputRatio > 1.5) {
+    srcW = Math.floor(vh * 9/16);
+    const preX = Math.floor((vw - srcW) / 2);
+    preCrop = `crop=${srcW}:${srcH}:${preX}:0,`;
   }
 
-  // ── 9:16 output ──────────────────────────────────────────────────────────────
-  // Two cases:
-  // A) Input is 16:9 (e.g. 1920x1080, 1280x720, 640x360) → crop 9:16 window + zoom
-  // B) Input is already 9:16 (e.g. 720x1280) → zoom + pan XY only
-
-  const is169  = inputRatio > 1.5;    // 16:9 or wider
-  const is916  = Math.abs(inputRatio - 9/16) < 0.05;
-
-  console.log(`  Input: ${vw}x${vh} ratio=${inputRatio.toFixed(2)} is169=${is169} is916=${is916}`);
-
-  // Detect where players actually are
-  const raw = await detectPlayerCentroids(videoPath, startTime, endTime, vw, vh);
+  const raw = await analyzeMotionFrames(videoPath, startTime, endTime, srcW, srcH);
 
   if (raw.length < 3) {
-    // Fallback: static crop
-    if (is169) {
-      const cw = Math.floor(vh * 9/16);
-      const cx = Math.floor((vw - cw) / 2);
-      return { vf: `crop=${cw}:${vh}:${cx}:0,scale=720:1280:flags=lanczos`, scFile: null };
-    }
-    return { vf: 'scale=720:1280:flags=lanczos', scFile: null };
+    const cw = Math.floor(srcW / 1.3), ch = Math.floor(srcH / 1.3);
+    const cx = Math.floor((srcW - cw) / 2), cy = Math.floor((srcH - ch) / 4);
+    return { vf: `${preCrop}crop=${cw}:${ch}:${cx}:${cy},scale=${outW}:${outH}:flags=lanczos`, scFile: null };
   }
 
-  const cx_s = smooth(raw.map(r => r.cx_norm), 15);
-  const cy_s = smooth(raw.map(r => r.cy_norm), 15);
-  const avgCx = cx_s.reduce((a,b)=>a+b,0)/cx_s.length;
-  const avgCy = cy_s.reduce((a,b)=>a+b,0)/cy_s.length;
-  console.log(`  Player centroid: cx=${avgCx.toFixed(2)} cy=${avgCy.toFixed(2)}`);
+  const motion_s = smoothArr(raw.map(r => r.motion), 6);
+  const cx_s     = smoothArr(raw.map(r => r.cx), 15);
+  const cy_s     = smoothArr(raw.map(r => r.cy), 15);
+  const maxM     = Math.max(...motion_s, 1);
 
-  // Zoom 1.5x — enough to remove empty space, not too tight
-  const ZOOM = 1.5;
+  // Fixed zoom per clip based on average motion intensity
+  const avgM  = motion_s.reduce((a,b) => a+b, 0) / motion_s.length;
+  const ZOOM  = 1.0 + Math.min(0.6, (avgM / maxM) * 0.6);
+  const cropW = Math.max(80, Math.floor(srcW / ZOOM));
+  const cropH = Math.max(80, Math.floor(srcH / ZOOM));
+  const maxX  = srcW - cropW;
+  const maxY  = srcH - cropH;
+  console.log(`  zoom=${ZOOM.toFixed(2)}x crop=${cropW}x${cropH}`);
 
-  let outW, outH, cropW, cropH, lines, cw0, ch0, cx0, cy0;
-
-  if (is169) {
-    // 16:9 → 9:16: first pick 9:16 window, then zoom
-    const base9_16W = Math.floor(vh * 9 / 16);
-    cropW = Math.floor(base9_16W / ZOOM);
-    cropH = Math.floor(vh / ZOOM);
-    outW = 720; outH = 1280;
-
-    lines = [];
-    for (let i = 0; i < raw.length; i++) {
-      const maxX = vw - cropW, maxY = vh - cropH;
-      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
-      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
-      const rel = Math.max(0, raw[i].t - startTime);
-      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
-      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
-    }
-    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
-    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
-    cw0 = cropW; ch0 = cropH;
-
-  } else {
-    // Already 9:16: zoom + pan XY
-    cropW = Math.floor(vw / ZOOM);
-    cropH = Math.floor(vh / ZOOM);
-    outW = vw; outH = vh;
-
-    lines = [];
-    for (let i = 0; i < raw.length; i++) {
-      const maxX = vw - cropW, maxY = vh - cropH;
-      const cx = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*vw - cropW/2)));
-      const cy = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*vh - cropH/2)));
-      const rel = Math.max(0, raw[i].t - startTime);
-      lines.push(`${rel.toFixed(3)} crop x ${cx};`);
-      lines.push(`${rel.toFixed(3)} crop y ${cy};`);
-    }
-    cx0 = Math.max(0, Math.min(vw-cropW, Math.floor(cx_s[0]*vw - cropW/2)));
-    cy0 = Math.max(0, Math.min(vh-cropH, Math.floor(cy_s[0]*vh - cropH/2)));
-    cw0 = cropW; ch0 = cropH;
+  const lines = [];
+  for (let i = 0; i < raw.length; i++) {
+    const cx_px = Math.max(0, Math.min(maxX, Math.floor(cx_s[i]*srcW - cropW/2)));
+    const cy_px = Math.max(0, Math.min(maxY, Math.floor(cy_s[i]*srcH*0.82 - cropH/2)));
+    const rel   = Math.max(0, raw[i].t - startTime);
+    lines.push(`${rel.toFixed(3)} crop x ${cx_px};`);
+    lines.push(`${rel.toFixed(3)} crop y ${cy_px};`);
   }
+
+  const cx0 = Math.max(0, Math.min(maxX, Math.floor(cx_s[0]*srcW - cropW/2)));
+  const cy0 = Math.max(0, Math.min(maxY, Math.floor(cy_s[0]*srcH*0.82 - cropH/2)));
 
   const scPath = path.join(TMP_DIR, `${clipId}_sc.txt`);
   await writeFile(scPath, lines.join('\n'));
 
   const vf = [
-    `sendcmd=f='${scPath}'`,
-    `crop=${cw0}:${ch0}:${cx0}:${cy0}`,
+    preCrop + `sendcmd=f='${scPath}'`,
+    `crop=${cropW}:${cropH}:${cx0}:${cy0}`,
     `scale=${outW}:${outH}:flags=lanczos`
   ].join(',');
 
   return { vf, scFile: scPath };
+}
+
+async function analyzeMotionFrames(videoPath, startTime, endTime, vw, vh) {
+  return new Promise((resolve) => {
+    const duration = Math.min(endTime - startTime, 45);
+    const fw = 180, fh = Math.round(180*vh/vw);
+    const proc = spawn('ffmpeg', [
+      '-ss', String(startTime), '-t', String(duration),
+      '-i', videoPath,
+      '-vf', `scale=${fw}:${fh}`,
+      '-f', 'rawvideo', '-pix_fmt', 'gray', '-r', '10', 'pipe:1'
+    ]);
+    const chunks = [];
+    proc.stdout.on('data', d => chunks.push(d));
+    proc.stderr.on('data', () => {});
+    proc.on('error', () => resolve([]));
+    setTimeout(() => { proc.kill(); resolve([]); }, 25000);
+    proc.on('close', () => {
+      try {
+        const fsize = fw * fh;
+        const raw = Buffer.concat(chunks);
+        const nFrames = Math.floor(raw.length / fsize);
+        if (nFrames < 2) return resolve([]);
+        const results = [];
+        const skipY = Math.floor(fh * 0.08);
+        for (let i = 1; i < nFrames; i++) {
+          const prev = raw.slice((i-1)*fsize, i*fsize);
+          const curr = raw.slice(i*fsize, (i+1)*fsize);
+          const cols = new Float32Array(fw);
+          const rows = new Float32Array(fh);
+          let total = 0;
+          for (let y = skipY; y < fh; y++) {
+            for (let x = 0; x < fw; x++) {
+              const d = Math.abs(curr[y*fw+x] - prev[y*fw+x]);
+              cols[x] += d; rows[y] += d; total += d;
+            }
+          }
+          const cx = total > 300 ? cols.reduce((s,v,x)=>s+v*x,0)/(total*fw) : 0.5;
+          const cy = total > 300 ? rows.reduce((s,v,y)=>s+v*y,0)/(total*fh) : 0.4;
+          results.push({ t: startTime + i/10, motion: total/fsize, cx, cy });
+        }
+        resolve(results);
+      } catch(e) { resolve([]); }
+    });
+  });
+}
+
+function smoothArr(arr, w) {
+  return arr.map((_, i) => {
+    const s = arr.slice(Math.max(0,i-w), i+w+1);
+    return s.reduce((a,b)=>a+b,0) / s.length;
+  });
 }
 
 // ─── Express ──────────────────────────────────────────────────────────────────
