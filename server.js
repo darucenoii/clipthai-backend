@@ -125,12 +125,20 @@ async function buildSmartCrop(videoPath, startTime, endTime, vw, vh, aspectRatio
   const outW = 720;
   const outH = aspectRatio === '9:16' ? 1280 : 720;
 
-  // For 16:9 input: pre-crop to 9:16 center slice first
+  // For 16:9 input: pre-crop to correct ratio based on aspectRatio
   let srcW = vw, srcH = vh, preCrop = '';
   if (inputRatio > 1.5) {
-    srcW = Math.floor(vh * 9/16);
-    const preX = Math.floor((vw - srcW) / 2);
-    preCrop = `crop=${srcW}:${srcH}:${preX}:0,`;
+    if (aspectRatio === '9:16') {
+      // 16:9 → take 9:16 center slice
+      srcW = Math.floor(vh * 9/16);
+      const preX = Math.floor((vw - srcW) / 2);
+      preCrop = `crop=${srcW}:${srcH}:${preX}:0,`;
+    } else if (aspectRatio === '1:1') {
+      // 16:9 → take center square slice
+      srcW = vh;
+      const preX = Math.floor((vw - srcW) / 2);
+      preCrop = `crop=${srcW}:${srcH}:${preX}:0,`;
+    }
   }
 
   const raw = await analyzeMotionFrames(videoPath, startTime, endTime, srcW, srcH);
