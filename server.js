@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, statSync } from 'fs';
 import { unlink, readFile, writeFile } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -277,10 +277,8 @@ async function ytdlpDownload(url, outputPath) {
       const cookiesContent = Buffer.from(_cookiesB64.trim(), 'base64').toString('utf8');
       if (cookiesContent.length < 100) throw new Error('Decoded cookies too short');
       // Use sync write to ensure file exists before yt-dlp runs
-      const { writeFileSync } = await import('node:fs');
       writeFileSync(cookiesPath, cookiesContent, 'utf8');
       // Verify file was written
-      const { statSync } = await import('node:fs');
       const stat = statSync(cookiesPath);
       if (stat.size > 0) {
         cookiesArg = ['--cookies', cookiesPath];
